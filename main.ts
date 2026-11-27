@@ -1,4 +1,4 @@
-// png-squeeze-01 v7: squeeze 1280x720 RGBA screenshots into the smallest
+// png-squeeze-01 v8: squeeze 1280x720 RGBA screenshots into the smallest
 // lossless PNG we can, within a fixed amount of work (never the wall clock).
 //
 // Per image:
@@ -7,18 +7,42 @@
 //      Is there one fully transparent colour a tRNS key could stand for?
 //   3. Try the lossless forms that can hold it (palette in three orders,
 //      grey / grey+alpha, RGB with a tRNS key, RGBA) with several per-row
-//      filter assignments (fixed 0/1/2/4, minimum-sum, fewest-pairs, brute
-//      force weighed by a small zlib run, and multi-band: a different
-//      strategy per horizontal band). Weigh every candidate with zlib
-//      at level 6; the smallest wins the screen.
+//      filter assignments (fixed 0/1/2/4, brute force weighed by a small
+//      zlib run, and multi-band: a different strategy per horizontal band).
+//      Weigh every candidate with zlib at level 6; the smallest wins.
 //   4. Write the winner with our own deflate encoder: a hash-chain match
 //      finder with a carried match (the best match at the previous position
 //      propagates forward one byte for free), a shortest-path (dynamic
 //      programming) parse that minimises the deflate bit cost under the
 //      block's Huffman lengths, and a choice of fixed Huffman, one dynamic
-//      block, or dynamic blocks split at DP-chosen points where a fresh
-//      table pays for its header. Two passes total: a greedy frequency
-//      estimate, then one optimal parse.
+//      block, or dynamic blocks split at DP-chosen points (refined by
+//      local shifts) where a fresh table pays for its header. Two passes
+//      total: a greedy frequency estimate, then one optimal parse.
+//
+// v8 changes over v7 (practice 733,586 -> 737,032, +3,446, still SAFE):
+//   - The finder chain is raised from 128 to 192 (6 candidates, short-chain
+//     32). Measured on the practice set: 128/6/32 -> 733,586 @ ~33.2 s;
+//     192/6/32 -> 735,428 @ ~34.7 s (+1,842 points for ~+1.5 s). The
+//     short chain and candidate cap are unchanged: SHORT 16 loses ~1,935
+//     points, CAND 4 loses ~2,078, both rejected. Runtime ~35 s here is
+//     ~52 s on the grader at its ~1.5x slowdown, inside the 60 s wall;
+//     v2 (37 s here) is the proof that ~37 s here completes.
+//   - Split refinement: after the DP picks block splits on the 2000-symbol
+//     grid, each split boundary is shifted by +-500/1000/1500 symbols and
+//     kept when the exact bits of the two adjacent blocks improve (up to
+//     two passes). Worth +1,604 points for ~+0.3 s - it recovers most of
+//     the finer-grid gain (grid 500 measured +4.4 points on i002/i007 but
+//     costs ~+1 s per image) at a fraction of the cost. The refinement
+//     only ever keeps a shift when the exact bit count improves, so it
+//     cannot make the emission worse.
+//   - Levers measured and NOT shipped: a finer DP grid by exact costing
+//     (grid 1000: +4.2 points on i002/i006/i007 but +2 s on i006 alone);
+//     'brute' at zlib level 6 (worse overall: i005 +675 B, and +2.5 s);
+//     a medium chain cap (best>=8 -> 64 steps: slower AND worse, the
+//     carry weakens); SHORT_CHAIN 48 (+891 points but +3 s); CAND 8
+//     (+219 points but +1.5 s); a first-appearance palette order (+1-4
+//     bytes on the flat images - negligible). Total runtime ~35 s on this
+//     VM (runs 34.8-35.2 s), lossless and deterministic.
 //
 // v7 changes over v6 (practice 738,024 -> 733,586, -4,438, but SAFE):
 //   - v6 (41.0-41.9 s here) was REJECTED like v3: its grade run TIMED
@@ -97,8 +121,8 @@
 //     count. The per-row 'brute' choice is myopic (one row + 32 KiB
 //     dict); a band choice sees the whole band's cross-row structure.
 //     Worth ~+2,500 points (i002 -1,438 B, i006 -784 B). Offered only
-//     for non-palette forms: on palette (flat) images it wins the
-//     zlib-6 screen but loses under the optimal parser (i005 regressed
+//     for non-palette forms: on palette (flat) images it wins the zlib-6
+//     screen but loses under the optimal parser (i005 regressed
 //     +357 B in testing), so palette keeps the v3 filter set.
 //   - Levers measured and NOT shipped (see NOTES.md): per-bucket Pareto
 //     frontier finder (worse: i002 +682 B, i007 +994 B); smoothed DP cost
@@ -888,21 +912,22 @@ function flushBits(w) {
 
 const HASH_BITS = 15;
 const HASH_SIZE = 1 << HASH_BITS;
-// v7 finder: chain 128, short-chain 32 when the best match is already
+// v8 finder: chain 192, short-chain 32 when the best match is already
 // >= 32, at most 6 length-beating candidates recorded per position.
-// v6 (512/6/32, 738,024 @ 41.5 s) was REJECTED like v3: its grade run
-// TIMED OUT on the grader. v2 (37 s here) completed but v6 (41 s here)
-// did not, so the grader is ~1.5x slower than this VM and the safe budget
-// here is <= 35 s. v7 buys the time back by cutting the chain to 128
-// (the parse calls the finder at every position, so the chain walk is
-// the dominant cost) and by dropping the 'minsum' and 'pairs' filter
-// choices from the screen (they never win the zlib-6 screen on any
-// practice image; the winners are fixed 0, 'brute' and 'bands').
-// Measured on the practice set: 128/6/32, no minsum/pairs -> 733,586
-// @ ~33 s. The short chain is the cheap win: when a long match is
-// already carried, a 32-step walk finds a closer (cheaper-distance)
-// match the 8-step walk misses.
-const MAX_CHAIN = 128;
+// v7 (128/6/32, 733,586 @ ~33 s) was SAFE on the grader (dev 733,580,
+// rank 356) - v7 is the proof that ~33 s here completes. v8 buys back
+// points with a longer chain: measured on the practice set, 128/6/32 ->
+// 733,586 @ ~33.2 s; 192/6/32 -> 735,428 @ ~34.7 s (+1,842 points for
+// ~+1.5 s). 176/6/32 is nearly the same score (736,959) for the same
+// time, so 192 stands. SHORT 16 loses ~1,935 points, CAND 4 loses
+// ~2,078, both rejected; SHORT 48 gains +891 but costs +3 s, CAND 8
+// gains +219 but costs +1.5 s, both rejected. A medium chain cap
+// (best>=8 -> 64 steps) is slower AND worse - the carry weakens.
+// The parse calls the finder at every position, so the chain walk is
+// the dominant cost; the short chain is the cheap win (when a long match
+// is already carried, a 32-step walk finds a closer, cheaper-distance
+// match the 8-step walk misses).
+const MAX_CHAIN = 192;
 const SHORT_CHAIN = 32;
 const MAX_MATCHES = 6;
 
@@ -1457,6 +1482,61 @@ function dpBlockInfo(parse, from, to) {
   return dynamicBlockInfo(f.litFreq, f.distFreq);
 }
 
+// Exact bit cost of ONE block: header bits + data bits under its own
+// dynamic Huffman table. The block's own table is chosen by its own
+// frequencies, so the cost is exact, not an estimate.
+function exactBlockBits(parse, from, to) {
+  const info = dpBlockInfo(parse, from, to);
+  return info.headerBits + rangeBits(parse, from, to, info.lit, info.dist);
+}
+
+// v8: SPLIT REFINEMENT. The DP above only places splits on a 2000-symbol
+// grid, but a split's true optimum is usually nearby. Shift each boundary
+// by +-500/1000/1500 symbols, keeping the shift when the exact bits of the
+// two adjacent blocks improve; up to two passes over the boundaries. The
+// refinement only ever keeps a shift when the exact bit count improves,
+// so it cannot make the emission worse. Measured: +1,604 points for
+// ~+0.3 s (i003 -351 B, i006 -388 B, i007 -153 B, i002 -91 B, i004 -141 B,
+// i008 -133 B, i005 -65 B, i001 -2 B). One pass gives 737,017 (only -15
+// vs two passes); reduced deltas (+-500/1000 only) give 737,020 (-12) -
+// the deltas and pass count barely matter, so the full form stands. It
+// recovers most of the finer-grid gain (grid 500 measured +4.4 points
+// on i002/i007 but costs ~+1 s per image) at a fraction of the cost.
+const REFINE_DELTAS = [-1500, -1000, -500, 500, 1000, 1500];
+const REFINE_PASSES = 2;
+function refineSplits(parse, dp) {
+  const splits = dp.splits.map(([a, b]) => [a, b]);
+  let bits = dp.bits;
+  for (let pass = 0; pass < REFINE_PASSES; pass++) {
+    let improved = false;
+    for (let i = 0; i < splits.length - 1; i++) {
+      const bnd = splits[i][1];
+      const oldBits =
+        exactBlockBits(parse, splits[i][0], bnd) + exactBlockBits(parse, bnd, splits[i + 1][1]);
+      let bestNb = 0;
+      let bestNbBits = oldBits;
+      for (const d of REFINE_DELTAS) {
+        const nb = bnd + d;
+        if (nb <= splits[i][0] || nb >= splits[i + 1][1]) continue;
+        const nbBits =
+          exactBlockBits(parse, splits[i][0], nb) + exactBlockBits(parse, nb, splits[i + 1][1]);
+        if (nbBits < bestNbBits) {
+          bestNbBits = nbBits;
+          bestNb = nb;
+        }
+      }
+      if (bestNb !== 0) {
+        splits[i][1] = bestNb;
+        splits[i + 1][0] = bestNb;
+        bits += bestNbBits - oldBits;
+        improved = true;
+      }
+    }
+    if (!improved) break;
+  }
+  return { bits, splits };
+}
+
 // Pick the cheapest way to write the parse (fixed Huffman, one dynamic
 // block, or dynamic blocks split every so many symbols) by exact bit cost,
 // then write it.
@@ -1496,7 +1576,11 @@ function emitDeflate(parse) {
   // can reproduce any uniform split (2000 is a grid multiple) and can also
   // place splits where the statistics actually change, so it is at least
   // as good as the best uniform split above.
-  const dp = dpSplit(parse);
+  let dp = dpSplit(parse);
+  // v8: refine the DP split boundaries by local shifts; keep the refined
+  // splits only when their exact bit cost beats the DP's.
+  const refined = refineSplits(parse, dp);
+  if (refined.bits < dp.bits) dp = refined;
   if (dp.bits < bestBits) {
     bestBits = dp.bits;
     best = { splits: -1, infos: dp.splits.map(([from, to]) => dpBlockInfo(parse, from, to)), dpSplits: dp.splits };
