@@ -1,145 +1,109 @@
-# png-squeeze-01 v3 — NOTES
+# PNG Squeeze v6 — NOTES
 
-## Result (practice set, 2026-11-27)
+Practice score **738,024** (v2: 726,401, **+11,623**; v5: 742,905, −4,881;
+v3: 736,995, +1,029). Runtime **41.1 s and 41.9 s** across two full runs
+of the final file on this VM (1.5 shared CPUs). All 8 instances lossless
+(pixel-by-pixel diff = 0 against the kit checker decoder) and deterministic
+(two full runs byte-identical). The final freshly-written main.ts produces
+byte-identical output to the experiment build on all 8 images.
 
-| image | theme | scale | v2 bytes | v3 bytes | delta | v3 points |
-|-------|-------|-------|----------|----------|-------|-----------|
-| i001 | flat | 13,547 | 11,897 | 11,763 | −134 | 754.5 |
-| i002 | rich | 55,063 | 51,999 | 48,867 | −3,132 | 741.7 |
-| i003 | alpha | 107,892 | 99,889 | 100,589 | +700 | 711.8 |
-| i004 | grey | 110,521 | 99,506 | 99,251 | −255 | 734.6 |
-| i005 | flat | 18,669 | 15,925 | 15,628 | −297 | 775.3 |
-| i006 | rich | 185,295 | 173,934 | 174,363 | +429 | 706.0 |
-| i007 | alpha | 64,285 | 60,920 | 58,423 | −2,497 | 727.5 |
-| i008 | grey | 26,807 | 23,993 | 23,671 | −322 | 744.7 |
-| **total** | | | **538,063** | **532,555** | **−5,508** | |
+## Per-instance results (practice set)
 
-- **Practice score: 736,995** (v2: 726,401; **+10,594**). Score = 1000 × mean of
-  per-instance points; points = 1000 × (2·scale − bytes) / (2·scale − scale/2).
-- **Runtime: 47–50 s** on this VM (1.5 shared CPUs; two runs: 47.3 s, 49.9 s).
-  Under the 60 s wall, but with less margin than v2 (37 s). The grader is 1 CPU;
-  if it runs ~20% slower than this VM the set lands near 58 s. Watch the dev
-  score: if v3 times out at check time it will not displace v2 (Force_Last
-  keeps the last *checked* entry).
-- **Lossless:** all 8 images decode pixel-identical to the reference
-  (kit checker decoder `program/scorer/checker/png.mjs`, diff = 0 on every
-  image, RGBA byte-for-byte).
-- **Deterministic:** two full runs produce byte-identical PNGs on all 8.
-- **Repo size:** main.ts is 1,325 lines (~46 KB); the repo stays far under 1 MiB.
+| id | theme | v2 bytes | v6 bytes | delta | v6 points |
+|----|-------|----------|----------|-------|-----------|
+| i001 | flat  | 11,897 | 11,881 | −16 | 748.7 |
+| i002 | rich  | 51,999 | 47,816 | −4,183 | 754.4 |
+| i003 | alpha | 99,889 | 99,999 | +110 | 715.4 |
+| i004 | grey  | 99,506 | 99,237 | −269 | 734.7 |
+| i005 | flat  | 15,925 | 15,682 | −243 | 773.3 |
+| i006 | rich  | 173,934 | 172,547 | −1,387 | 712.5 |
+| i007 | alpha | 60,920 | 59,174 | −1,746 | 719.7 |
+| i008 | grey  | 23,993 | 23,640 | −353 | 745.4 |
+| **total score** | | **726,401** | **738,024** | | |
 
-## What v3 changed (measured, not guessed)
+Points = 1000·(2·scale − bytes)/(2·scale − scale/2), clamped 0–1000, with
+scale bytes i001 13547, i002 55063, i003 107892, i004 110521, i005 18669,
+i006 185295, i007 64285, i008 26807. Score = 1000·mean(points).
 
-### 1. The finder now matches a 3-byte prefix, not 4 — ~+1,400 points
+Still **~50,500 points below the rank-50 cutoff (788,539)** and ~67,100
+below the top score (805,100). v6 trades score for safety on purpose;
+see "Why v6 exists".
 
-The v2 `findMatches` required the candidate's first **4** bytes to equal the
-target's, then extended from offset 4. A match of length exactly 3 has a
-differing 4th byte, so the old finder could *never* find a length-3 match
-directly — the only length-3 matches it ever returned came via the carry
-(a length-4+ match at the previous position shortened by one). In RGB data
-a pixel is 3 bytes, so length-3 matches are everywhere; zopfli takes
-thousands of them and v2 took almost none.
+## What shipped: the finder cut back to 512/6/32
 
-Fix: compare a 3-byte prefix and extend from offset 3. Measured on i002
-(baseline finder): 51,999 → 51,015 (−984). On the full set with the medium
-finder it is worth ~+1,400 points (score 734,300 vs 732,900 for the same
-finder with the 4-byte check). It hurts two images in raw bytes (i003 +1,330,
-i006 +935 at the baseline finder) but the score weights small-scale images
-more, so the net is positive.
+v5's finder (chain 1024, 8 candidates, short-chain 64) is cut to chain
+512, at most 6 length-beating candidates, short-chain 32 when the best
+match is already >= 32. Everything else is kept from v5: the 3-byte
+prefix fix, DP block splitting, RGB-only multi-band filters.
 
-### 2. Finder widened to chain 1024 / 8 candidates / short-chain 64 — ~+2,700 points
+Finder sweep (all with the v5 levers, practice set):
 
-v2 used chain 512, 4 candidates, short-chain 8. Sweep on i002 (3-byte fix,
-no iteration):
+| config (chain/cand/short) | score | runtime |
+|---------------------------|-------|---------|
+| 512 / 4 / 8 (v2's finder) | 732,674 | 39.1 s |
+| 512 / 4 / 32 | 736,248 | 41.0 s |
+| 512 / 6 / 8 | 734,831 | 40.3 s |
+| **512 / 6 / 32 (v6)** | **738,024** | **41.5 s** |
+| 512 / 8 / 64 (v3's finder, v5 levers) | ~734,300* | ~45 s |
 
-| chain | matches | short | i002 bytes | i002 time |
-|-------|---------|-------|-----------|-----------|
-| 512 | 4 | 8 | 51,015 | 3.8 s |
-| 512 | 8 | 64 | 49,102 | 5.1 s |
-| 1024 | 8 | 64 | 48,867 | ~5 s |
-| 1024 | 8 | 128 | 48,674 | 6.5 s |
-| 1024 | 16 | 128 | 48,612 | 6.4 s |
-| 2048 | 16 | 128 | 49,653* | 6.9 s |
-| 4096 | 16 | 512 | 49,085 | 15.0 s |
+\* v3 NOTES: 512/8/64 with the 3-byte fix was 734,300 @ 45.1 s without
+the v5 levers; the v6 config beats it on both score and time because
+MAX_MATCHES 6 (not 8) and the DP split + RGB bands add points cheaply.
 
-\* the 2048/16/128 run predates the 3-byte fix; the 4096 run likewise.
+The short chain is the cheap win: when a long match is already carried,
+a 32-step walk finds a closer (cheaper-distance) match the 8-step walk
+misses — worth ~+3,600 points for ~+2 s (512/4/8 -> 512/4/32), mostly on
+the rich and alpha images (i002 −871 B, i007 −1,094 B). Adding the 5th
+and 6th candidates is worth ~+1,800 more for ~+0.5 s (512/4/32 ->
+512/6/32). The two effects stack almost fully additively.
 
-Full-set results (3-byte fix, no iteration): 512/8/64 → 734,300 @ 45.1 s;
-1024/8/64 → **736,995 @ ~48 s**; 1024/8/128 → 738,200 @ 56.3 s;
-1024/16/128 → 737,990 @ 55.1 s. The 1024/8/64 setting is the sweet spot:
-+2,700 over 512/8/64 for +1.8 s, while the next step buys only +1,200
-for +9.4 s. v3 ships 1024/8/64.
+## Why v6 exists (why v3/v4/v5 were not submittable)
 
-### 3. Parse↔cost iteration (zopfli-style) — implemented, measured, NOT shipped
-
-After the first optimal parse, re-derive the Huffman cost model from the
-parse's own symbol frequencies and re-parse; repeat until the gain is
-<0.1% (cap 3 rounds). Measured per image:
-
-| image | iter0 | iter1 | iter2 | iter3 | total gain |
-|-------|-------|-------|-------|-------|-----------|
-| i001 | 11,753 | 11,616 | 11,572 | 11,565 | −1.6% |
-| i002 | 51,936 | 51,753 | 51,739 | — | −0.38% |
-
-It converges in 1–2 rounds but each round costs a full extra finder+DP
-pass (~2.5× total time: i002 3.7 s → 9.0 s for 3 rounds). With the 60 s
-wall it does not pay, so v3 ships a single parse and the iteration code
-was removed rather than left dormant. Selective iteration on just the two
-small flat images (i001, i005) was also measured: +~1,200 points for +12 s
-— not worth it either.
-
-### 4. DP block splitting — not built
-
-v2 already splits dynamic blocks at fixed sizes (2k/5k/10k/20k/50k/100k/
-200k symbols), picking the cheapest by exact bit cost. Zopfli's own block
-splitting adds only ~2% over no splitting, and the fixed sizes already
-capture most of that. A DP over split points was not built: the remaining
-gap is in the parse itself (see below), not in the split points, and the
-time budget is already spent on the finder.
-
-## Diagnosis that drove v3 (why the gap is in the parse)
-
-- Zopfli's deflate run on v2's *own* filtered stream beats v2 by 12–13%
-  (i001: v2 IDAT 11,759 vs zopfli-deflate 10,211; i002: 51,942 vs 45,577),
-  and v2's stream is actually *better* than zopfli-png's own stream. So the
-  gap is in the deflate, not in filter/form choice.
-- Zopfli's single optimal pass (1 iter, no split) is already 8–10% better
-  than v2's single optimal pass; iteration adds ~2.5% / ~0.6% and block
-  splitting ~2% / ~1.7%. The dominant difference is the parse itself.
-- Position-by-position parse comparison (i002): 3,483 positions where v2
-  has a literal but zopfli has a match covering it. Most are **length-3**
-  matches at medium distances (e.g. pos 2248 len 3 dist 207; pos 17981
-  len 3 dist 945) — the 4-byte-prefix blind spot — plus longer matches in
-  repeating 3-byte patterns where the chain walk burned its 4 candidate
-  slots on incrementally-longer matches (6/9/12/15) and broke before
-  reaching the longest one (20 at dist 7679).
-- Under v2's own cost model those matches are far cheaper than the
-  literals (e.g. len-20 @7679 = 22 bits vs 20 literals = 160 bits), so the
-  DP would take them *if the finder returned them*. The finder was the
-  bottleneck, not the cost model. The 3-byte fix + wider finder close
-  part of it; a residual gap remains (below).
+- **v3 REJECTED 2026-11-27 ~21:13 WIB: grade run TIMED OUT** (fail
+  run_completes). v3's practice runtime was 47.3/49.9 s on this VM but
+  >60 s on the grader's 1 CPU — the grader is ~25-30% slower than this
+  VM. RULES.txt: a run past the wall "earns nothing on any column: it
+  has no score, ranks below every scored entry and takes no reward."
+  The rejection did NOT displace v2, so v2 (726,401, rank 398) is still
+  the final entry.
+- **v4 (739,523 @ 52.9-61.5 s) and v5 (742,905 @ 50.4-54.0 s)** were
+  built and verified but never submitted — both would time out on the
+  grader at the measured slowdown.
+- **Safe runtime on this VM is <= 42 s**: 42 s here is ~52-55 s on the
+  grader at 25-30% slowdown, inside the 60 s wall with margin. v6 runs
+  41.1-41.9 s here, i.e. ~52-54 s there. The runtime is CPU-bound
+  (user time ≈ real time), so the grader's dedicated 1 CPU should be
+  more consistent than this VM's shared CPU — but the margin is kept
+  anyway.
 
 ## Remaining gap
 
-- Zopfli ceiling (local, pip zopfli 0.4.3 on v2's streams): **778,646**.
-  v3 is **41,651 points** below it; the rank-50 cutoff is 777,641
-  (**40,646 below**); the top score is 800,545.
-- v3 does **not** reach the prize zone. The residual gap is still in the
-  parse: even with the big finder (chain 4096/16/512) v2's parse had 8,877
-  literals vs zopfli's 6,220 on i002, and 2,844 positions where v2 is a
-  literal but zopfli has a match. The remaining misses are longer matches
-  in repeating patterns that the chain walk still does not reach, and
-  length-3 matches whose cost the DP's greedy-derived model misprices
-  (greedy length-code 257 has frequency 0, so its cost length is 14).
-- Ideas not tried (for a v4, time permitting): a Pareto/cost-based
-  candidate set instead of length-only (record a candidate when it is not
-  dominated in length *and* distance-cost); re-derive the DP cost model
-  from a *smoothed* frequency that does not starve short matches; DP block
-  splitting; per-image adaptive chain (big finder only where it helps
-  most — i002/i007 saved ~2,400 bytes each, i003/i006 ~100–600).
+- Zopfli ceiling (local, on v3's streams): **~778,646**. Our v6 is
+  738,024, so ~40,600 points of the gap is the deflate itself.
+- The top entry (805,100, "Dual-Start Multi-Band Filter + Run-Aware
+  Optimal Block-Split") beats the zopfli ceiling by ~26,000 points, so
+  its stream is better than zopfli-png's. We have taken both of its
+  named levers (multi-band filters, optimal block splitting) and are
+  still ~67,000 points behind — its edge is in the details (its
+  "dual-start" filter search and "run-aware" split placement).
+- What is left, if a v7 is attempted (only with runtime to spare — v6
+  has ~0.5 s of headroom to the 42 s budget, so any v7 lever must be
+  nearly free or must buy its own time): a finer DP grid (1000 symbols)
+  for the block split; a "dual-start" filter search (two different
+  starting filter assignments per band, keeping the better); per-image
+  adaptive chain. The finder, the cost model, and parse<->cost
+  iteration have all been measured and are exhausted (see v4/v5 NOTES).
 
-## Files
+## Verification
 
-- `main.ts` — the deliverable (Node 22, stdlib only). Written fresh in
-  this session in 7 chunks; the rewritten file was verified byte-identical
-  in output to the experimental build on all 8 images.
-- `README.md`, `LICENSE` (MIT).
+- Practice set: `~/workspace/png-squeeze-01/png-squeeze-01-run-20261127-kit/practice/input/`
+- Losslessness: pixel-by-pixel diff = 0 for all 8 instances, using the kit
+  checker's decoder (`program/scorer/checker/png.mjs`), run on the final
+  freshly-written file's output.
+- Determinism: two full runs of the final file byte-identical (`diff -r`
+  clean).
+- Byte-identity: the final freshly-written main.ts produces byte-identical
+  output to the experiment build on all 8 images.
+- Runtime: 41.1 s and 41.9 s across two full runs of the final file on
+  this VM (1.5 shared CPUs); the 60 s wall is on 1 CPU, ~25-30% slower.
+- Repo size: main.ts 1,559 lines (~57 KB); total well under the 1 MiB limit.

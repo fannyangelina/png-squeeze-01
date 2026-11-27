@@ -1,4 +1,4 @@
-// png-squeeze-01 v3: squeeze 1280x720 RGBA screenshots into the smallest
+// png-squeeze-01 v6: squeeze 1280x720 RGBA screenshots into the smallest
 // lossless PNG we can, within a fixed amount of work (never the wall clock).
 //
 // Per image:
@@ -8,16 +8,82 @@
 //   3. Try the lossless forms that can hold it (palette in three orders,
 //      grey / grey+alpha, RGB with a tRNS key, RGBA) with several per-row
 //      filter assignments (fixed 0/1/2/4, minimum-sum, fewest-pairs, brute
-//      force weighed by a small zlib run). Weigh every candidate with zlib
+//      force weighed by a small zlib run, and multi-band: a different
+//      strategy per horizontal band). Weigh every candidate with zlib
 //      at level 6; the smallest wins the screen.
 //   4. Write the winner with our own deflate encoder: a hash-chain match
 //      finder with a carried match (the best match at the previous position
 //      propagates forward one byte for free), a shortest-path (dynamic
 //      programming) parse that minimises the deflate bit cost under the
 //      block's Huffman lengths, and a choice of fixed Huffman, one dynamic
-//      block, or dynamic blocks split at 2k-200k symbols where a fresh
+//      block, or dynamic blocks split at DP-chosen points where a fresh
 //      table pays for its header. Two passes total: a greedy frequency
 //      estimate, then one optimal parse.
+//
+// v6 changes over v5 (practice 742,905 -> 738,024, -4,881, but SAFE):
+//   - The grader is ~25-30% SLOWER than this VM. v3 (47.3/49.9 s here)
+//     TIMED OUT on the grader and was REJECTED (fail run_completes);
+//     v5 (50.4-54.0 s here) would time out too. A run past the wall
+//     "earns nothing on any column" (RULES.txt) and, as the Force_Last
+//     entry, would displace v2's 726,401. v2 (726,401, rank 398) is still
+//     the final entry; v6 exists to beat it WITHOUT timing out.
+//   - The finder is cut back from 1024/8/64 to 512/6/32 (chain 512, at
+//     most 6 length-beating candidates, short-chain 32 when the best
+//     match is already >= 32). Measured on the practice set:
+//     512/4/8 -> 732,674 @ 39.1 s; 512/4/32 -> 736,248 @ 41.0 s;
+//     512/6/8 -> 734,831 @ 40.3 s; 512/6/32 -> 738,024 @ 41.5 s.
+//     The short chain is the cheap win: when a long match is already
+//     carried, a 32-step walk finds a closer (cheaper-distance) match
+//     the 8-step walk misses, worth ~+3,600 points for ~+2 s, mostly
+//     on the rich and alpha images (i002 -871 B, i007 -1,094 B).
+//   - Everything else is kept from v5: the 3-byte prefix fix, DP block
+//     splitting (+3,381, ~+1 s), RGB-only multi-band filters (+2,528).
+//     Total runtime ~41.5 s on this VM (two runs: 41.6 s, 41.5 s), which
+//     at the grader's ~25-30% slowdown is ~52-54 s - inside the 60 s
+//     wall with margin. Safe runtime on this VM is <= 42 s.
+//
+// v5 changes over v4 (practice 739,523 -> 742,905, +3,381):
+//   - Multi-band filters are offered ONLY for RGB (type 2) forms. The band
+//     weighing (7 strategies x 4 bands = 28 zlib-6 runs) costs ~6-8 s per
+//     image, and on the practice set it only ever gained on the two rich
+//     (RGB) images (i002 -1,438 B, i006 -784 B); the alpha/grey images
+//     pay the cost and gain nothing. Restricting bands to RGB keeps the
+//     full +2,528 points and cuts ~3-4 s, back to ~49-52 s.
+//   - DP block splitting: split points are chosen by dynamic programming
+//     over a 2000-symbol grid by exact bit cost (prefix symbol counts make
+//     a block's frequency and data bits O(alphabet)), replacing the fixed
+//     uniform 2k-200k splits. The DP can reproduce any uniform split and
+//     also places splits where the statistics actually change. Worth
+//     +3,381 points (every image gains: i006 -1,097 B, i003 -868 B,
+//     i007 -511 B, i004 -438 B, i002 -235 B, i008 -133 B, i005 -47 B,
+//     i001 -40 B) for ~+1 s. Total runtime ~51 s on this VM.
+//   - Total runtime ~51 s on this VM (v4: 53-61 s), under the 60 s wall.
+//     v4 was NOT submitted: its 53-61 s runtime risked a timeout, and
+//     RULES.txt says a run past the wall "earns nothing on any column".
+//
+// v4 changes over v3 (practice 736,995 -> 739,523, +2,528):
+//   - Multi-band filters: the rows are split into 4 horizontal bands and
+//     each band gets the filter strategy (fixed 0/1/2/4, minsum, pairs,
+//     brute) that minimises zlib-6 over that band's filtered rows, using
+//     all preceding filtered data as the dictionary so cross-row matches
+//     count. The per-row 'brute' choice is myopic (one row + 32 KiB
+//     dict); a band choice sees the whole band's cross-row structure.
+//     Worth ~+2,500 points (i002 -1,438 B, i006 -784 B). Offered only
+//     for non-palette forms: on palette (flat) images it wins the
+//     zlib-6 screen but loses under the optimal parser (i005 regressed
+//     +357 B in testing), so palette keeps the v3 filter set.
+//   - Levers measured and NOT shipped (see NOTES.md): per-bucket Pareto
+//     frontier finder (worse: i002 +682 B, i007 +994 B); smoothed DP cost
+//     model (worse: i002 +76 B, i007 +250 B); deeper chain walk
+//     (SHORT_CHAIN 128 gains ~+5 pts on i002/i007 but costs +2.8 s, and
+//     the full-set time would breach the 60 s wall); parse<->cost
+//     iteration (only +0.4% for 2x time). The deflate gap to zopfli
+//     (~5.8% on i002) is not in the finder (an oracle shows it finds
+//     nearly the brute-force longest match) nor in the cost model - it
+//     is in zopfli's optimal block splitting and Huffman table work,
+//     which our fixed uniform splits already approximate. (v5 takes the
+//     block-splitting half of that gap with the DP above.)
+//   - Total runtime ~53-56 s on this VM, under the 60 s wall.
 //
 // v3 changes over v2 (practice 726,401 -> 736,995, +10,594):
 //   - The finder now matches a 3-byte prefix, not 4. A length-3 match has
@@ -479,6 +545,70 @@ function filtered(samples, width, height, bpp, choice, raw) {
   return raw;
 }
 
+// v4: MULTI-BAND filters. Split the rows into 4 horizontal bands; each
+// band gets the filter strategy (fixed 0/1/2/4, minsum, pairs, brute) that
+// minimises zlib-6 over that band's filtered rows, using all preceding
+// filtered data as the dictionary so cross-row matches count. The per-row
+// 'brute' choice is myopic (one row + 32 KiB dict); a band choice sees the
+// whole band's cross-row structure. v5 offers bands only for RGB forms:
+// the band weighing costs ~6-8 s per image and only ever gained on the
+// two rich (RGB) images; palette keeps the v3 filter set (on palette it
+// wins the zlib-6 screen but loses under the optimal parser, i005 +357 B).
+const BANDS = 4;
+const BAND_STRATEGIES = [0, 1, 2, 4, 'minsum', 'pairs', 'brute'];
+function filterRows(samples, width, bpp, y0, y1, choice, out) {
+  const stride = width * bpp;
+  const trial = typeof choice === 'number' ? null : Array.from({ length: 5 }, () => new Uint8Array(stride));
+  const seen = new Uint32Array(65536);
+  let stamp = 0;
+  for (let y = y0; y < y1; y++) {
+    const cur = samples.subarray(y * stride, (y + 1) * stride);
+    const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
+    const at = (y - y0) * (stride + 1);
+    if (typeof choice === 'number') {
+      out[at] = choice;
+      filterRow(choice, cur, prev, bpp, out.subarray(at + 1, at + 1 + stride));
+      continue;
+    }
+    const before = out.subarray(Math.max(0, at - BRUTE_CONTEXT), at);
+    let type = 0;
+    let best = Infinity;
+    for (let t = 0; t < 5; t++) {
+      filterRow(t, cur, prev, bpp, trial[t]);
+      let cost;
+      if (choice === 'minsum') cost = signedSum(trial[t]);
+      else if (choice === 'pairs') cost = pairsOf(trial[t], seen, ++stamp);
+      else cost = deflateSync(trial[t], { level: BRUTE_LEVEL, memLevel: 9, dictionary: before.length === 0 ? undefined : before }).length;
+      if (cost < best) { best = cost; type = t; }
+    }
+    out[at] = type;
+    out.set(trial[type], at + 1);
+  }
+  return out;
+}
+function filteredBands(samples, width, height, bpp, raw) {
+  const stride = width * bpp;
+  const size = height * (stride + 1);
+  if (raw === null || raw.length !== size) raw = new Uint8Array(size);
+  const bandRows = Math.ceil(height / BANDS);
+  const cand = new Uint8Array(bandRows * (stride + 1));
+  for (let b = 0; b < BANDS; b++) {
+    const y0 = b * bandRows;
+    const y1 = Math.min(height, y0 + bandRows);
+    if (y0 >= height) break;
+    const dict = raw.subarray(0, y0 * (stride + 1));
+    let bestBuf = null;
+    let bestBytes = Infinity;
+    for (const s of BAND_STRATEGIES) {
+      const buf = filterRows(samples, width, bpp, y0, y1, s, cand);
+      const n = deflateSync(buf.subarray(0, (y1 - y0) * (stride + 1)), { level: 6, memLevel: 8, dictionary: dict.length === 0 ? undefined : dict }).length;
+      if (n < bestBytes) { bestBytes = n; bestBuf = buf.slice(0, (y1 - y0) * (stride + 1)); }
+    }
+    raw.set(bestBuf, y0 * (stride + 1));
+  }
+  return raw;
+}
+
 const chunkBytes = (form) =>
   (form.plte === null ? 0 : 12 + form.plte.length) + (form.trns === null ? 0 : 12 + form.trns.length);
 
@@ -513,7 +643,13 @@ function formsOf(rgba) {
     samples: samplesOf(rgba, ct),
     plte: null,
     trns,
-    filters: [0, 1, 2, 4, 'minsum', 'pairs', 'brute'],
+    // v5: bands only for RGB (type 2). The band weighing (7 strategies x
+    // 4 bands = 28 zlib-6 runs) costs ~6-8 s per image, and on the practice
+    // set it only ever gained on the two rich (RGB) images (i002 -1,438 B,
+    // i006 -784 B); the alpha/grey images pay the cost and gain nothing.
+    filters: ct === 2
+      ? [0, 1, 2, 4, 'minsum', 'pairs', 'brute', 'bands']
+      : [0, 1, 2, 4, 'minsum', 'pairs', 'brute'],
   });
   return forms;
 }
@@ -529,7 +665,9 @@ function screen(rgba, width, height) {
     const size = height * (width * form.bpp + 1);
     const chunks = chunkBytes(form);
     for (const choice of form.filters) {
-      const data = filtered(form.samples, width, height, form.bpp, choice, spare !== null && spare.length === size ? spare : null);
+      const data = choice === 'bands'
+        ? filteredBands(form.samples, width, height, form.bpp, spare !== null && spare.length === size ? spare : null)
+        : filtered(form.samples, width, height, form.bpp, choice, spare !== null && spare.length === size ? spare : null);
       spare = null;
       const zlib = deflateSync(data, SCREEN);
       const bytes = zlib.length + chunks;
@@ -722,14 +860,19 @@ function flushBits(w) {
 
 const HASH_BITS = 15;
 const HASH_SIZE = 1 << HASH_BITS;
-// v3 finder: chain 1024, short-chain 64 when the best match is already
-// >= 32, at most 8 length-beating candidates recorded per position.
-// (v2 used 512/8/4. Measured on the practice set: 1024/8/64 is +2,700
-// points over 512/8/64 for +1.8 s; 1024/8/128 is only +1,200 more for
-// +9.4 s, so 64 is the sweet spot.)
-const MAX_CHAIN = 1024;
-const SHORT_CHAIN = 64;
-const MAX_MATCHES = 8;
+// v6 finder: chain 512, short-chain 32 when the best match is already
+// >= 32, at most 6 length-beating candidates recorded per position.
+// v3/v4/v5 used 1024/8/64, but v3 TIMED OUT on the grader: the grader is
+// ~25-30% slower than this VM, so 47-50 s here is not safe. v6 buys the
+// time back here and keeps the cheap levers (3-byte prefix fix, DP block
+// splitting, RGB-only multi-band filters). Measured on the practice set:
+// 512/4/8 -> 732,674 @ 39.1 s; 512/4/32 -> 736,248 @ 41.0 s;
+// 512/6/8 -> 734,831 @ 40.3 s; 512/6/32 -> 738,024 @ 41.5 s. The short
+// chain is the cheap win: when a long match is already carried, a 32-step
+// walk finds a closer (cheaper-distance) match the 8-step walk misses.
+const MAX_CHAIN = 512;
+const SHORT_CHAIN = 32;
+const MAX_MATCHES = 6;
 
 function hashAt(data, i) {
   return (
@@ -1201,6 +1344,87 @@ function writeSymbols(w, parse, from, to, litCodes, litLens, distCodes, distLens
   writeBits(w, reverseBits(litCodes[256], litLens[256]), litLens[256]);
 }
 
+// v5: DP block splitting. Choose split points on a grid by exact bit cost,
+// instead of only the fixed 2k-200k uniform splits. The parse is fixed;
+// only the emission changes, so the DP works on the symbol sequence.
+// Prefix counts make a block's frequency and data bits O(alphabet) instead
+// of O(block length). Returns { bits, splits } where splits are [from, to)
+// symbol ranges in order.
+const DP_GRID = 2000;
+function dpSplit(parse) {
+  const count = parse.count;
+  const pts = [];
+  for (let p = 0; p < count; p += DP_GRID) pts.push(p);
+  pts.push(count);
+  const G = pts.length;
+  const litPref = new Array(G);
+  const matPref = new Array(G);
+  const litRun = new Uint32Array(288);
+  const matRun = new Uint32Array(29 * 30);
+  let g = 0;
+  litPref[0] = litRun.slice();
+  matPref[0] = matRun.slice();
+  for (let s = 0; s < count; s++) {
+    const ls = parse.litSym[s];
+    litRun[ls]++;
+    if (ls >= 257) matRun[(ls - 257) * 30 + parse.distSym[s]]++;
+    if (s + 1 === pts[g + 1]) {
+      g++;
+      litPref[g] = litRun.slice();
+      matPref[g] = matRun.slice();
+    }
+  }
+  // Exact bits of the block [pts[a], pts[b]) under its own dynamic table.
+  const blockBits = (a, b) => {
+    const litFreq = new Uint32Array(288);
+    const distFreq = new Uint32Array(30);
+    const la = litPref[a], lb = litPref[b];
+    const ma = matPref[a], mb = matPref[b];
+    for (let s = 0; s < 288; s++) litFreq[s] = lb[s] - la[s];
+    for (let k = 0; k < 29 * 30; k++) {
+      const c = mb[k] - ma[k];
+      if (c) distFreq[k % 30] += c;
+    }
+    litFreq[256]++;
+    const info = dynamicBlockInfo(litFreq, distFreq);
+    let bits = info.headerBits + info.lit[256];
+    for (let s = 0; s < 288; s++) {
+      const c = lb[s] - la[s];
+      if (c) bits += c * info.lit[s];
+    }
+    for (let k = 0; k < 29 * 30; k++) {
+      const c = mb[k] - ma[k];
+      if (c) bits += c * (LEN_EXTRA[(k / 30) | 0] + info.dist[k % 30] + DIST_EXTRA[k % 30]);
+    }
+    return bits;
+  };
+  const INF = 1 << 30;
+  const dp = new Float64Array(G).fill(INF);
+  const prevPt = new Int32Array(G).fill(-1);
+  dp[0] = 0;
+  for (let b = 1; b < G; b++) {
+    for (let a = 0; a < b; a++) {
+      if (dp[a] === INF) continue;
+      const c = dp[a] + blockBits(a, b);
+      if (c < dp[b]) { dp[b] = c; prevPt[b] = a; }
+    }
+  }
+  const splits = [];
+  for (let b = G - 1; b > 0; ) {
+    const a = prevPt[b];
+    splits.unshift([pts[a], pts[b]]);
+    b = a;
+  }
+  return { bits: dp[G - 1], splits };
+}
+
+// Info (Huffman tables + header) for one DP block, recomputed for the few
+// blocks on the optimal path.
+function dpBlockInfo(parse, from, to) {
+  const f = freqOfRange(parse, from, to);
+  return dynamicBlockInfo(f.litFreq, f.distFreq);
+}
+
 // Pick the cheapest way to write the parse (fixed Huffman, one dynamic
 // block, or dynamic blocks split every so many symbols) by exact bit cost,
 // then write it.
@@ -1236,6 +1460,15 @@ function emitDeflate(parse) {
       best = { splits: maxSym, infos };
     }
   }
+  // v5: DP split points on a 2000-symbol grid, by exact bit cost. The DP
+  // can reproduce any uniform split (2000 is a grid multiple) and can also
+  // place splits where the statistics actually change, so it is at least
+  // as good as the best uniform split above.
+  const dp = dpSplit(parse);
+  if (dp.bits < bestBits) {
+    bestBits = dp.bits;
+    best = { splits: -1, infos: dp.splits.map(([from, to]) => dpBlockInfo(parse, from, to)), dpSplits: dp.splits };
+  }
   const w = bitWriter(Math.ceil(bestBits / 8) + 16);
   if (best.infos === null) {
     writeBits(w, 1, 1);
@@ -1244,7 +1477,7 @@ function emitDeflate(parse) {
   } else {
     let from = 0;
     for (let b = 0; b < best.infos.length; b++) {
-      const to = best.splits === 0 ? count : Math.min(count, from + best.splits);
+      const to = best.splits === 0 ? count : best.splits === -1 ? best.dpSplits[b][1] : Math.min(count, from + best.splits);
       const info = best.infos[b];
       writeDynamicHeader(w, info, b === best.infos.length - 1);
       writeSymbols(
@@ -1273,6 +1506,7 @@ function emitDeflate(parse) {
 // 51,739 over 3 rounds) but costs a full extra finder+DP pass per round
 // (~2.5x total time). With the 60 s wall it does not pay, so v3 ships a
 // single parse. The iteration code was removed rather than left dormant.
+// (Re-measured in v4 on the v3 stream: the same ~0.4% for 2x time.)
 function optimalDeflate(data) {
   const n = data.length;
   const head = new Int32Array(HASH_SIZE);
