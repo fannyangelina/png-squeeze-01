@@ -1,114 +1,145 @@
-# PNG Squeeze v2 — notes
+# png-squeeze-01 v3 — NOTES
 
-## Practice-set result (2026-11-27)
+## Result (practice set, 2026-11-27)
 
-| instance | scale | v2 bytes | v2 pts | v1 bytes | v1 pts | zopfli bytes |
-|----------|------:|---------:|-------:|---------:|-------:|-------------:|
-| i001 flat  | 13,547 | 11,897 | 747.8 | 12,496 | 717.9 | 10,396 |
-| i002 rich  | 55,063 | 51,999 | 703.8 | 51,852 | 707.6 | 46,895 |
-| i003 alpha | 107,892 | 99,889 | 716.1 | 106,605 | 694.7 | 93,941 |
-| i004 grey  | 110,521 | 99,506 | 733.1 | 105,567 | 717.9 | 98,714 |
-| i005 flat  | 18,669 | 15,925 | 764.6 | 16,552 | 745.6 | 14,145 |
-| i006 rich  | 185,295 | 173,934 | 707.5 | 178,840 | 698.9 | 162,128 |
-| i007 alpha | 64,285 | 60,920 | 701.6 | 60,890 | 701.9 | 53,392 |
-| i008 grey  | 26,807 | 23,993 | 736.6 | 24,897 | 724.6 | 21,717 |
-| **total**  |        |         | **726,401** |    | **705,406** | **~778,646** |
+| image | theme | scale | v2 bytes | v3 bytes | delta | v3 points |
+|-------|-------|-------|----------|----------|-------|-----------|
+| i001 | flat | 13,547 | 11,897 | 11,763 | −134 | 754.5 |
+| i002 | rich | 55,063 | 51,999 | 48,867 | −3,132 | 741.7 |
+| i003 | alpha | 107,892 | 99,889 | 100,589 | +700 | 711.8 |
+| i004 | grey | 110,521 | 99,506 | 99,251 | −255 | 734.6 |
+| i005 | flat | 18,669 | 15,925 | 15,628 | −297 | 775.3 |
+| i006 | rich | 185,295 | 173,934 | 174,363 | +429 | 706.0 |
+| i007 | alpha | 64,285 | 60,920 | 58,423 | −2,497 | 727.5 |
+| i008 | grey | 26,807 | 23,993 | 23,671 | −322 | 744.7 |
+| **total** | | | **538,063** | **532,555** | **−5,508** | |
 
-v2 beats v1 on 6 of 8 instances (+20,995 points overall). It loses
-slightly on i002 (51,999 vs 51,852) and i007 (60,920 vs 60,890), where
-zlib-9 on v1's stream is a touch better than my optimal parse.
-Runtime ~37 s for the full set (limit 60 s). All 8 lossless
-(pixel-by-pixel vs the kit checker's decoder) and deterministic
-(two runs byte-identical).
+- **Practice score: 736,995** (v2: 726,401; **+10,594**). Score = 1000 × mean of
+  per-instance points; points = 1000 × (2·scale − bytes) / (2·scale − scale/2).
+- **Runtime: 47–50 s** on this VM (1.5 shared CPUs; two runs: 47.3 s, 49.9 s).
+  Under the 60 s wall, but with less margin than v2 (37 s). The grader is 1 CPU;
+  if it runs ~20% slower than this VM the set lands near 58 s. Watch the dev
+  score: if v3 times out at check time it will not displace v2 (Force_Last
+  keeps the last *checked* entry).
+- **Lossless:** all 8 images decode pixel-identical to the reference
+  (kit checker decoder `program/scorer/checker/png.mjs`, diff = 0 on every
+  image, RGBA byte-for-byte).
+- **Deterministic:** two full runs produce byte-identical PNGs on all 8.
+- **Repo size:** main.ts is 1,325 lines (~46 KB); the repo stays far under 1 MiB.
 
-## What v2 adds over v1
+## What v3 changed (measured, not guessed)
 
-Own deflate with optimal (shortest-path DP) parsing, replacing zlib-9
-for the winning stream:
+### 1. The finder now matches a 3-byte prefix, not 4 — ~+1,400 points
 
-- Hash-chain match finder (3-byte hash, 15-bit table, window 32 KiB,
-  max match 258, min 3) with a **carried match**: the best match found
-  at position i−1 is a match of length L−1 at the same distance here,
-  so it costs nothing to re-find. Once a long match is discovered the
-  carry propagates it down the run and the chain walk only needs to look
-  for a closer one.
-- DP parse minimising exact deflate bit cost (literal/length and
-  distance code lengths + extra bits), trying only bucket-top lengths
-  per match (proven sufficient: within a length-code bucket every length
-  costs the same bits, so the longest dominates).
-- Fixed + dynamic Huffman (package-merge code lengths), block splitting
-  at 2k/5k/10k/20k/50k/100k/200k symbols, chosen by exact bit count.
-- Two passes: greedy frequency estimate, then one optimal parse.
-  (A second re-parse gained only ~0.4% on i002 for double the time,
-  so it was dropped.)
+The v2 `findMatches` required the candidate's first **4** bytes to equal the
+target's, then extended from offset 4. A match of length exactly 3 has a
+differing 4th byte, so the old finder could *never* find a length-3 match
+directly — the only length-3 matches it ever returned came via the carry
+(a length-4+ match at the previous position shortened by one). In RGB data
+a pixel is 3 bytes, so length-3 matches are everywhere; zopfli takes
+thousands of them and v2 took almost none.
 
-## Bugs found and fixed during the build
+Fix: compare a 3-byte prefix and extend from offset 3. Measured on i002
+(baseline finder): 51,999 → 51,015 (−984). On the full set with the medium
+finder it is worth ~+1,400 points (score 734,300 vs 732,900 for the same
+finder with the 4-byte check). It hurts two images in raw bytes (i003 +1,330,
+i006 +935 at the baseline finder) but the score weights small-scale images
+more, so the net is positive.
 
-1. **Non-canonical Huffman codes** — the single-pass `canonicalCodes`
-   fed the post-assignment incremented code back into the next length's
-   recurrence (double-counted `bl_count`); fixed-Huffman literal 65 got
-   code 161 instead of 113. Symptom: "invalid bit length repeat" on
-   inflate. Fix: two-pass (compute `nextCode[]` first, then assign).
-2. **Match-length overestimate** — the old finder extended from `best+1`
-   after only checking `data[p+best] === data[i+best]`, without verifying
-   bytes 4..best−1. Fix: `matchLen()` verifies all bytes from 4.
-3. **Free symbols in the DP cost model** — lengths built from raw
-   frequencies gave length 0 to symbols the greedy never used, so the DP
-   chased "free" long matches and the real emit paid full price. Fix:
-   smooth every emittable symbol to frequency ≥ 1 for the DP cost model
-   only; the emit still uses raw frequencies from the actual parse.
-4. **Carry pruned the closest match** — seeding the DP's `best` with the
-   carried (long, far) match made the chain walk skip the closest
-   candidate, which is often a short match at distance 3–4 costing only
-   ~2 distance bits and used heavily. i002 went 7% bigger. Fix: always
-   record the first (closest) chain candidate, and scan `cand` for the
-   longest when carrying (the list is no longer length-ordered).
+### 2. Finder widened to chain 1024 / 8 candidates / short-chain 64 — ~+2,700 points
 
-## Experiments and measurements (i002, same stream)
+v2 used chain 512, 4 candidates, short-chain 8. Sweep on i002 (3-byte fix,
+no iteration):
 
-- Chain length (no carry): 48 → 55,520 B; 256 → 53,649 B;
-  1024 → 52,226 B; zlib-9 → 51,795 B. Longer chains find better
-  matches but are slow.
-- Chain length (with carry + closest-candidate fix): 1 → 76,893 B
-  (carry alone is not enough); 4 → 60,756 B; 16 → 55,551 B;
-  64 → 53,353 B; 256 → 52,842 B (4.8 s); 512 → 52,621 B (5.2 s);
-  1024 → 52,344 B (5.7 s); 4096 → 52,543 B — chain length stops
-  mattering past ~1024; the finder is not the bottleneck any more.
-- Passes (i002): greedy+dp1+dp2 → 52,621 B, 5.1 s;
-  greedy+dp1 → 52,851 B, 2.7 s (kept); fixed-cost dp1 only → 53,863 B.
-- Block splits (i002): 50k+ only → 52,851 B; adding 2k/5k/10k/20k →
-  51,942 B (saved 909 B). Smaller splits (500/1000) give nothing extra
-  on flat images.
-- Full-set chain choice: 256 → 724,367 (33.7 s); **512 → 726,401
-  (36.9 s, kept)**; 1024 → 728,727 (49.4 s — too close to the 60 s
-  wall on a 1-CPU grader, rejected).
-- Filter re-weighing: optimal-parsing the screen's runner-up on i002
-  gives 54,418 B vs 52,851 B for the winner — the zlib-6 screen already
-  ranks candidates the same way the optimal parser does, so parsing a
-  second candidate is not worth doubling the work.
+| chain | matches | short | i002 bytes | i002 time |
+|-------|---------|-------|-----------|-----------|
+| 512 | 4 | 8 | 51,015 | 3.8 s |
+| 512 | 8 | 64 | 49,102 | 5.1 s |
+| 1024 | 8 | 64 | 48,867 | ~5 s |
+| 1024 | 8 | 128 | 48,674 | 6.5 s |
+| 1024 | 16 | 128 | 48,612 | 6.4 s |
+| 2048 | 16 | 128 | 49,653* | 6.9 s |
+| 4096 | 16 | 512 | 49,085 | 15.0 s |
 
-## The gap to 800k
+\* the 2048/16/128 run predates the 3-byte fix; the 4096 run likewise.
 
-v2 totals 538,063 bytes vs zopfli's ~501,328 (~6.8% more bytes), worth
-~52k points. Per-instance the gap is 0.8% (i004) to 14% (i001, i007).
-What was ruled out as the cause: match-finder chain length (4096 does
-not beat 1024), block splitting (small splits help rich images, nothing
-on flat ones), a second DP pass (+0.4%), and filter choice (the screen
-already picks the optimal-parser winner). The remaining gap is in the
-parse/cost model itself — a true zopfli-level compressor iterates the
-parse↔cost refinement to convergence and splits blocks by dynamic
-programming over split points rather than fixed sizes, and the top
-entries (800k+) do something beyond plain zopfli. Those are the levers
-for a v3, but each costs significant runtime against the 60 s wall, so
-v2 ships at 726k as a safe, verified improvement over v1's 705k.
+Full-set results (3-byte fix, no iteration): 512/8/64 → 734,300 @ 45.1 s;
+1024/8/64 → **736,995 @ ~48 s**; 1024/8/128 → 738,200 @ 56.3 s;
+1024/16/128 → 737,990 @ 55.1 s. The 1024/8/64 setting is the sweet spot:
++2,700 over 512/8/64 for +1.8 s, while the next step buys only +1,200
+for +9.4 s. v3 ships 1024/8/64.
 
-## Verification
+### 3. Parse↔cost iteration (zopfli-style) — implemented, measured, NOT shipped
 
-- Lossless: `/tmp/verify.mjs` decodes input and output with the kit
-  checker's decoder (`program/scorer/checker/png.mjs`) and compares
-  RGBA pixel-by-pixel; all 8 report `diff=0`.
-- Deterministic: two full runs produce byte-identical outputs for all 8.
-- Runtime: ~37 s for the full set on this VM (1.5 shared CPUs); the
-  grader is 1 CPU, so this leaves headroom under the 60 s wall.
-- Repo size: main.ts 45,700 bytes + README + LICENSE + NOTES, well
-  under the 1 MiB limit.
+After the first optimal parse, re-derive the Huffman cost model from the
+parse's own symbol frequencies and re-parse; repeat until the gain is
+<0.1% (cap 3 rounds). Measured per image:
+
+| image | iter0 | iter1 | iter2 | iter3 | total gain |
+|-------|-------|-------|-------|-------|-----------|
+| i001 | 11,753 | 11,616 | 11,572 | 11,565 | −1.6% |
+| i002 | 51,936 | 51,753 | 51,739 | — | −0.38% |
+
+It converges in 1–2 rounds but each round costs a full extra finder+DP
+pass (~2.5× total time: i002 3.7 s → 9.0 s for 3 rounds). With the 60 s
+wall it does not pay, so v3 ships a single parse and the iteration code
+was removed rather than left dormant. Selective iteration on just the two
+small flat images (i001, i005) was also measured: +~1,200 points for +12 s
+— not worth it either.
+
+### 4. DP block splitting — not built
+
+v2 already splits dynamic blocks at fixed sizes (2k/5k/10k/20k/50k/100k/
+200k symbols), picking the cheapest by exact bit cost. Zopfli's own block
+splitting adds only ~2% over no splitting, and the fixed sizes already
+capture most of that. A DP over split points was not built: the remaining
+gap is in the parse itself (see below), not in the split points, and the
+time budget is already spent on the finder.
+
+## Diagnosis that drove v3 (why the gap is in the parse)
+
+- Zopfli's deflate run on v2's *own* filtered stream beats v2 by 12–13%
+  (i001: v2 IDAT 11,759 vs zopfli-deflate 10,211; i002: 51,942 vs 45,577),
+  and v2's stream is actually *better* than zopfli-png's own stream. So the
+  gap is in the deflate, not in filter/form choice.
+- Zopfli's single optimal pass (1 iter, no split) is already 8–10% better
+  than v2's single optimal pass; iteration adds ~2.5% / ~0.6% and block
+  splitting ~2% / ~1.7%. The dominant difference is the parse itself.
+- Position-by-position parse comparison (i002): 3,483 positions where v2
+  has a literal but zopfli has a match covering it. Most are **length-3**
+  matches at medium distances (e.g. pos 2248 len 3 dist 207; pos 17981
+  len 3 dist 945) — the 4-byte-prefix blind spot — plus longer matches in
+  repeating 3-byte patterns where the chain walk burned its 4 candidate
+  slots on incrementally-longer matches (6/9/12/15) and broke before
+  reaching the longest one (20 at dist 7679).
+- Under v2's own cost model those matches are far cheaper than the
+  literals (e.g. len-20 @7679 = 22 bits vs 20 literals = 160 bits), so the
+  DP would take them *if the finder returned them*. The finder was the
+  bottleneck, not the cost model. The 3-byte fix + wider finder close
+  part of it; a residual gap remains (below).
+
+## Remaining gap
+
+- Zopfli ceiling (local, pip zopfli 0.4.3 on v2's streams): **778,646**.
+  v3 is **41,651 points** below it; the rank-50 cutoff is 777,641
+  (**40,646 below**); the top score is 800,545.
+- v3 does **not** reach the prize zone. The residual gap is still in the
+  parse: even with the big finder (chain 4096/16/512) v2's parse had 8,877
+  literals vs zopfli's 6,220 on i002, and 2,844 positions where v2 is a
+  literal but zopfli has a match. The remaining misses are longer matches
+  in repeating patterns that the chain walk still does not reach, and
+  length-3 matches whose cost the DP's greedy-derived model misprices
+  (greedy length-code 257 has frequency 0, so its cost length is 14).
+- Ideas not tried (for a v4, time permitting): a Pareto/cost-based
+  candidate set instead of length-only (record a candidate when it is not
+  dominated in length *and* distance-cost); re-derive the DP cost model
+  from a *smoothed* frequency that does not starve short matches; DP block
+  splitting; per-image adaptive chain (big finder only where it helps
+  most — i002/i007 saved ~2,400 bytes each, i003/i006 ~100–600).
+
+## Files
+
+- `main.ts` — the deliverable (Node 22, stdlib only). Written fresh in
+  this session in 7 chunks; the rewritten file was verified byte-identical
+  in output to the experimental build on all 8 images.
+- `README.md`, `LICENSE` (MIT).

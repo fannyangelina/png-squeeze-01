@@ -1,57 +1,49 @@
-# PNG Squeeze v2 — optimal-parsing deflate
+# PNG Squeeze v3
 
-Squeezes 8 screenshots (1280×720 RGBA) into the smallest lossless PNGs.
-Node 22, standard library only, no dependencies. Deterministic, single
-run, well under the 60 s wall.
+Squeeze 1280×720 RGBA screenshots into the smallest lossless PNG, within a
+fixed amount of work (never the wall clock). Node 22, standard library only.
 
 ## How it works
 
-1. **Decode + analyse** each input PNG (own decoder, CRC-checked).
-   Detects opaque / grey / ≤256-colour images and a transparent key.
-2. **Colour-type reduction**: palette (3 orderings), grey, grey+alpha,
-   RGB, RGBA — whichever form fits the pixels.
-3. **Per-row filters**: fixed filters (None/Sub/Up/Average/Paeth) plus
-   adaptive assignments (min-sum, fewest-pairs, brute-force per row).
-   Candidates are weighed with zlib level 6; the winner is kept.
-4. **Optimal deflate** (the v2 addition): the winning filtered stream is
-   re-compressed with our own deflate — a hash-chain match finder with a
-   **carried match** (the best match at the previous position propagates
-   forward one byte for free, so long matches are found once and reused),
-   a shortest-path dynamic-programming parse that minimises exact deflate
-   bit cost, fixed + dynamic Huffman (package-merge lengths), and block
-   splitting at 2k–200k symbols. Two passes: a greedy frequency estimate,
-   then one optimal parse.
-5. **Write** the smallest valid PNG (IHDR / PLTE / tRNS / IDAT / IEND).
+Per image:
 
-## Results (practice set)
+1. **Decode** the input PNG (any colour type 0/2/3/4/6, bit depth 8) to RGBA.
+2. **Analyse**: opaque? grey? how many distinct colours (up to 257)? Is there
+   one fully transparent colour a tRNS key could stand for?
+3. **Try the lossless forms** that can hold it (palette in three orders,
+   grey / grey+alpha, RGB with a tRNS key, RGBA) with several per-row filter
+   assignments (fixed 0/1/2/4, minimum-sum, fewest-pairs, brute force weighed
+   by a small zlib run). Weigh every candidate with zlib at level 6; the
+   smallest wins the screen.
+4. **Write the winner with our own deflate encoder**: a hash-chain match
+   finder with a carried match, a shortest-path (dynamic programming) parse
+   that minimises the deflate bit cost under the block's Huffman lengths,
+   and a choice of fixed Huffman, one dynamic block, or dynamic blocks split
+   at 2k–200k symbols where a fresh table pays for its header.
 
-| instance | bytes | points |
-|----------|------:|-------:|
-| i001 flat  | 11,897 | 747.8 |
-| i002 rich  | 51,999 | 703.8 |
-| i003 alpha | 99,889 | 716.1 |
-| i004 grey  | 99,506 | 733.1 |
-| i005 flat  | 15,925 | 764.6 |
-| i006 rich  | 173,934 | 707.5 |
-| i007 alpha | 60,920 | 701.6 |
-| i008 grey  | 23,993 | 736.6 |
-| **total score** | | **726,401** |
+## v3 vs v2
 
-v1 scored 705,406 on the same set, so v2 gains **+20,995 points**.
-Runtime ~37 s for the full set on this machine (limit 60 s). All 8
-instances verified lossless pixel-by-pixel with the kit checker's decoder,
-and two runs are byte-identical.
+Practice score **736,995** (v2: 726,401; +10,594), runtime ~48 s (v2: 37 s).
 
-## Usage
+- The finder now matches a **3-byte prefix, not 4**: a length-3 match has a
+  differing 4th byte, so the old finder could never find one directly — and
+  length-3 matches are everywhere in RGB data. Worth ~+1,400 points.
+- Finder widened to **chain 1024, 8 candidates, short-chain 64** (v2:
+  512/4/8): +2,700 points for +1.8 s.
+- Parse↔cost iteration was implemented and measured but **not shipped**:
+  only ~0.5% gain for ~2.5× the time. See `NOTES.md` for the full
+  measurements, the per-instance results, and the remaining gap to zopfli.
+
+## Run
 
 ```sh
-node main.ts   # reads $MAKEFUN_INPUT_DIR (default /input),
-               # writes $MAKEFUN_OUTPUT_DIR (default /output)
+node --experimental-strip-types main.ts
 ```
 
-## Files
+Reads 8 screenshots from `$MAKEFUN_INPUT_DIR` (default `/input`), writes
+lossless PNGs to `$MAKEFUN_OUTPUT_DIR` (default `/output`). Deterministic:
+fixed choices, fixed hash seeds, no clock reads, no randomness.
 
-- `main.ts` — the whole compressor (decoder, analysis, filters, optimal
-  deflate, driver). Written from scratch in this session.
-- `NOTES.md` — per-instance results, what was tried, and the gap to 800k.
-- `LICENSE` — MIT.
+## License
+
+MIT — see `LICENSE`.

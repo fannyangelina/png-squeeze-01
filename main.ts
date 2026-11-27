@@ -1,4 +1,4 @@
-// png-squeeze-01 v2: squeeze 1280x720 RGBA screenshots into the smallest
+// png-squeeze-01 v3: squeeze 1280x720 RGBA screenshots into the smallest
 // lossless PNG we can, within a fixed amount of work (never the wall clock).
 //
 // Per image:
@@ -15,14 +15,23 @@
 //      propagates forward one byte for free), a shortest-path (dynamic
 //      programming) parse that minimises the deflate bit cost under the
 //      block's Huffman lengths, and a choice of fixed Huffman, one dynamic
-//      block, or dynamic blocks split at 2k–200k symbols where a fresh
+//      block, or dynamic blocks split at 2k-200k symbols where a fresh
 //      table pays for its header. Two passes total: a greedy frequency
-//      estimate, then one optimal parse. (A second re-parse gained only
-//      ~0.4% for double the time, so it was dropped; chain 512 is the
-//      sweet spot — 1024 gains ~2k points for +12 s, too close to the
-//      60 s wall on a 1-CPU grader.) That is where the bytes go: zlib's
-//      greedy matcher leaves several percent on the table against an
-//      optimal parse, and this is the whole point of v2.
+//      estimate, then one optimal parse.
+//
+// v3 changes over v2 (practice 726,401 -> 736,995, +10,594):
+//   - The finder now matches a 3-byte prefix, not 4. A length-3 match has
+//     a differing 4th byte, so the old 4-byte check could never find one
+//     directly (only via the carry) - and length-3 matches are everywhere
+//     in RGB data, where a pixel is 3 bytes. Worth ~+1,400 points.
+//   - Finder widened to chain 1024, 8 candidates, short-chain 64 (v2:
+//     512/4/8). Measured: +2,700 points over 512/8/64 for +1.8 s; the
+//     next step (1024/8/128) is only +1,200 more for +9.4 s, so 64 is
+//     the sweet spot. Total runtime 47 s on this VM, under the 60 s wall.
+//   - Parse<->cost iteration (zopfli-style) was implemented and measured
+//     but NOT shipped: it gains only ~0.5% (i001 11,753 -> 11,565; i002
+//     51,936 -> 51,739 over 3 rounds) for ~2.5x the time, which the 60 s
+//     wall does not afford. The single parse stands. (See NOTES.md.)
 //
 // Everything is deterministic: fixed choices, fixed hash seeds, no clock
 // reads, no randomness, no environment-dependent variation. The work per
@@ -713,9 +722,14 @@ function flushBits(w) {
 
 const HASH_BITS = 15;
 const HASH_SIZE = 1 << HASH_BITS;
-const MAX_CHAIN = 512;
-const SHORT_CHAIN = 8;
-const MAX_MATCHES = 4;
+// v3 finder: chain 1024, short-chain 64 when the best match is already
+// >= 32, at most 8 length-beating candidates recorded per position.
+// (v2 used 512/8/4. Measured on the practice set: 1024/8/64 is +2,700
+// points over 512/8/64 for +1.8 s; 1024/8/128 is only +1,200 more for
+// +9.4 s, so 64 is the sweet spot.)
+const MAX_CHAIN = 1024;
+const SHORT_CHAIN = 64;
+const MAX_MATCHES = 8;
 
 function hashAt(data, i) {
   return (
@@ -776,14 +790,18 @@ function findMatches(data, head, prev, i, n, out, prevLen, prevDist, prevMax) {
   }
   let p = head[hashAt(data, i)];
   if (p < 0 || i - p > 32768) return out.length >> 1;
-  const v = (data[i] << 24) | (data[i + 1] << 16) | (data[i + 2] << 8) | data[i + 3];
+  // v3: compare a 3-byte prefix, not 4. A match of length exactly 3 has a
+  // differing 4th byte, so the old 4-byte check could never find it — and
+  // length-3 matches are everywhere in RGB data (3-byte pixels). The only
+  // length-3 matches the old finder ever returned came via the carry.
+  const v = (data[i] << 16) | (data[i + 1] << 8) | data[i + 2];
   const maxSteps = best >= 32 ? SHORT_CHAIN : MAX_CHAIN;
   let steps = 0;
   let first = true;
   while (p >= 0 && steps < maxSteps) {
     steps++;
     if (i - p > 32768) break;
-    if (((data[p] << 24) | (data[p + 1] << 16) | (data[p + 2] << 8) | data[p + 3]) === v) {
+    if (((data[p] << 16) | (data[p + 1] << 8) | data[p + 2]) === v) {
       let len;
       if (first) {
         // Always record the closest candidate, even when it is shorter than
@@ -791,7 +809,7 @@ function findMatches(data, head, prev, i, n, out, prevLen, prevDist, prevMax) {
         // bits and the DP uses it heavily. (Pruning it away made i002
         // 7% bigger.)
         first = false;
-        len = matchLen(data, p, i, maxLen, 4);
+        len = matchLen(data, p, i, maxLen, 3);
         if (len >= 3) {
           out.push(len, i - p);
           if (len > best) best = len;
@@ -799,7 +817,7 @@ function findMatches(data, head, prev, i, n, out, prevLen, prevDist, prevMax) {
         }
       } else if (best > 4) {
         // This candidate can only beat `best` if it also matches at `best`.
-        if (data[p + best] === data[i + best]) len = matchLen(data, p, i, maxLen, 4);
+        if (data[p + best] === data[i + best]) len = matchLen(data, p, i, maxLen, 3);
         else len = best; // a tie at a larger distance; dominated, skip it
         if (len > best) {
           best = len;
@@ -808,7 +826,7 @@ function findMatches(data, head, prev, i, n, out, prevLen, prevDist, prevMax) {
           if (best >= 64 && out.length >= 4) break;
         }
       } else {
-        len = matchLen(data, p, i, maxLen, 4);
+        len = matchLen(data, p, i, maxLen, 3);
         if (len > best) {
           best = len;
           out.push(len, i - p);
@@ -996,19 +1014,6 @@ function optimalParse(data, litCost, distCost, head, prev) {
     }
   }
   return { litSym, distSym, lenExtraVal, distExtraVal, count };
-}
-
-// Symbol frequencies of a parse (end of block counted once).
-function freqFromParse(parse) {
-  const litFreq = new Uint32Array(288);
-  const distFreq = new Uint32Array(30);
-  const { litSym, distSym, count } = parse;
-  for (let s = 0; s < count; s++) {
-    litFreq[litSym[s]]++;
-    if (litSym[s] >= 257) distFreq[distSym[s]]++;
-  }
-  litFreq[256]++;
-  return { litFreq, distFreq };
 }
 
 // Lengths for the DP cost model: every symbol that could be emitted gets a
@@ -1258,13 +1263,16 @@ function emitDeflate(parse) {
   return flushBits(w);
 }
 
-// Our own deflate for one filtered stream: greedy frequencies, then two
-// shortest-path parses re-deriving the Huffman lengths, then the cheapest
-// emission — wrapped in a zlib header and Adler-32.
+// Our own deflate for one filtered stream: greedy frequencies, then one
+// shortest-path parse under the Huffman cost model derived from them, then
+// the cheapest emission — wrapped in a zlib header and Adler-32.
 //
-// Two passes only: a greedy frequency estimate, then one optimal parse.
-// A second re-parse (dp2) gained only ~0.4% on i002 for double the time,
-// so it is dropped — the 60 s wall matters more than 230 bytes.
+// v3 note on parse<->cost iteration (zopfli-style): it was implemented and
+// measured — re-deriving the cost model from the parse's own frequencies
+// and re-parsing gains only ~0.5% (i001 11,753 -> 11,565; i002 51,936 ->
+// 51,739 over 3 rounds) but costs a full extra finder+DP pass per round
+// (~2.5x total time). With the 60 s wall it does not pay, so v3 ships a
+// single parse. The iteration code was removed rather than left dormant.
 function optimalDeflate(data) {
   const n = data.length;
   const head = new Int32Array(HASH_SIZE);
