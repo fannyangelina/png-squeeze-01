@@ -1,4 +1,4 @@
-// png-squeeze-01 v6: squeeze 1280x720 RGBA screenshots into the smallest
+// png-squeeze-01 v7: squeeze 1280x720 RGBA screenshots into the smallest
 // lossless PNG we can, within a fixed amount of work (never the wall clock).
 //
 // Per image:
@@ -20,6 +20,33 @@
 //      table pays for its header. Two passes total: a greedy frequency
 //      estimate, then one optimal parse.
 //
+// v7 changes over v6 (practice 738,024 -> 733,586, -4,438, but SAFE):
+//   - v6 (41.0-41.9 s here) was REJECTED like v3: its grade run TIMED
+//     OUT on the grader. v2 (37 s here) completed but v6 (41 s here) did
+//     not, so the grader is ~1.5x slower than this VM and the safe budget
+//     here is <= 35 s (35 s here is ~52 s there). v7 exists to beat v2's
+//     726,401 WITHOUT timing out.
+//   - The finder is cut back from 512/6/32 to 128/6/32 (chain 128, at
+//     most 6 length-beating candidates, short-chain 32 when the best
+//     match is already >= 32). The parse calls the finder at every
+//     position, so the chain walk is the dominant cost: 512 -> 128
+//     saves ~5 s for ~-4,400 points. Measured on the practice set:
+//     512/6/32 -> 738,024 @ 41.5 s; 256/6/32 -> 736,330 @ ~35.8 s;
+//     192/6/32 -> 735,428 @ ~36.0 s; 128/6/32 -> 733,586 @ ~33.2 s;
+//     64/6/32 -> 729,566 @ 33.3 s. (256/192 run too close to the wall
+//     on this VM once the grader's ~1.5x slowdown is applied.)
+//   - The 'minsum' and 'pairs' filter choices are dropped from the
+//     screen (palette and non-palette forms keep fixed 0/1/2/4, 'brute'
+//     and, for RGB, 'bands'). They never win the zlib-6 screen on any
+//     practice image - the winners are fixed 0, 'brute' and 'bands' -
+//     so dropping them costs 0 points and saves ~2 s. The band
+//     strategies still try all 7 (dropping minsum/pairs there lost
+//     272 points on i006 for ~0.1 s).
+//   - Everything else is kept from v6: the 3-byte prefix fix, DP block
+//     splitting (+3,381, ~+1 s), RGB-only multi-band filters (+2,528).
+//     Total runtime ~33-35 s on this VM (runs 32.7-35.5 s), which at the
+//     grader's ~1.5x slowdown is ~50-53 s - inside the 60 s wall.
+//
 // v6 changes over v5 (practice 742,905 -> 738,024, -4,881, but SAFE):
 //   - The grader is ~25-30% SLOWER than this VM. v3 (47.3/49.9 s here)
 //     TIMED OUT on the grader and was REJECTED (fail run_completes);
@@ -38,9 +65,10 @@
 //     on the rich and alpha images (i002 -871 B, i007 -1,094 B).
 //   - Everything else is kept from v5: the 3-byte prefix fix, DP block
 //     splitting (+3,381, ~+1 s), RGB-only multi-band filters (+2,528).
-//     Total runtime ~41.5 s on this VM (two runs: 41.6 s, 41.5 s), which
-//     at the grader's ~25-30% slowdown is ~52-54 s - inside the 60 s
-//     wall with margin. Safe runtime on this VM is <= 42 s.
+//     Total runtime ~41.5 s on this VM (two runs: 41.1 s, 41.9 s), which
+//     was THOUGHT safe at the grader's ~25-30% slowdown (~52-54 s) -
+//     but v6 TIMED OUT on the grader anyway. The grader is ~1.5x
+//     slower, not ~1.25x: safe runtime on this VM is <= 35 s.
 //
 // v5 changes over v4 (practice 739,523 -> 742,905, +3,381):
 //   - Multi-band filters are offered ONLY for RGB (type 2) forms. The band
@@ -617,9 +645,9 @@ function formsOf(rgba) {
   const forms = [];
   if (colours !== null) {
     for (const [order, filters] of [
-      ['count', [0, 'minsum', 'brute']],
-      ['luminance', [0, 'minsum', 'brute']],
-      ['first', [0, 'minsum', 'brute']],
+      ['count', [0, 'brute']],
+      ['luminance', [0, 'brute']],
+      ['first', [0, 'brute']],
     ]) {
       const p = paletteForm(rgba, colours, order);
       forms.push({ colourType: 3, bpp: 1, samples: p.indices, plte: p.plte, trns: p.trns, filters });
@@ -648,8 +676,8 @@ function formsOf(rgba) {
     // set it only ever gained on the two rich (RGB) images (i002 -1,438 B,
     // i006 -784 B); the alpha/grey images pay the cost and gain nothing.
     filters: ct === 2
-      ? [0, 1, 2, 4, 'minsum', 'pairs', 'brute', 'bands']
-      : [0, 1, 2, 4, 'minsum', 'pairs', 'brute'],
+      ? [0, 1, 2, 4, 'brute', 'bands']
+      : [0, 1, 2, 4, 'brute'],
   });
   return forms;
 }
@@ -860,17 +888,21 @@ function flushBits(w) {
 
 const HASH_BITS = 15;
 const HASH_SIZE = 1 << HASH_BITS;
-// v6 finder: chain 512, short-chain 32 when the best match is already
+// v7 finder: chain 128, short-chain 32 when the best match is already
 // >= 32, at most 6 length-beating candidates recorded per position.
-// v3/v4/v5 used 1024/8/64, but v3 TIMED OUT on the grader: the grader is
-// ~25-30% slower than this VM, so 47-50 s here is not safe. v6 buys the
-// time back here and keeps the cheap levers (3-byte prefix fix, DP block
-// splitting, RGB-only multi-band filters). Measured on the practice set:
-// 512/4/8 -> 732,674 @ 39.1 s; 512/4/32 -> 736,248 @ 41.0 s;
-// 512/6/8 -> 734,831 @ 40.3 s; 512/6/32 -> 738,024 @ 41.5 s. The short
-// chain is the cheap win: when a long match is already carried, a 32-step
-// walk finds a closer (cheaper-distance) match the 8-step walk misses.
-const MAX_CHAIN = 512;
+// v6 (512/6/32, 738,024 @ 41.5 s) was REJECTED like v3: its grade run
+// TIMED OUT on the grader. v2 (37 s here) completed but v6 (41 s here)
+// did not, so the grader is ~1.5x slower than this VM and the safe budget
+// here is <= 35 s. v7 buys the time back by cutting the chain to 128
+// (the parse calls the finder at every position, so the chain walk is
+// the dominant cost) and by dropping the 'minsum' and 'pairs' filter
+// choices from the screen (they never win the zlib-6 screen on any
+// practice image; the winners are fixed 0, 'brute' and 'bands').
+// Measured on the practice set: 128/6/32, no minsum/pairs -> 733,586
+// @ ~33 s. The short chain is the cheap win: when a long match is
+// already carried, a 32-step walk finds a closer (cheaper-distance)
+// match the 8-step walk misses.
+const MAX_CHAIN = 128;
 const SHORT_CHAIN = 32;
 const MAX_MATCHES = 6;
 

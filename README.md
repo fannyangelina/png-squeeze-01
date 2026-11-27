@@ -1,40 +1,51 @@
-# PNG Squeeze v6
+# PNG Squeeze v7
 
 Squeeze 1280x720 RGBA screenshots into the smallest lossless PNG, within a
-fixed amount of work (never the wall clock).
+fixed amount of work (never the wall clock). Node 22, standard library only.
 
-**Practice score: 738,024** (v2: 726,401; v5: 742,905; v3: 736,995).
-**Runtime: ~41.5 s** on this VM (two runs: 41.1 s, 41.9 s) — the safe budget,
-because the grader is ~25-30% slower than this VM and v3 (47-50 s here)
-timed out on it. At the grader's slowdown, 41.5 s here is ~52-54 s there,
-inside the 60 s wall with margin.
+## Result (practice set)
+
+Practice score **733,586** (v2 submitted: 726,401; v6: 738,024; v5: 742,905).
+Runtime **~33-35 s** on this VM (1.5 shared CPUs) — inside the 60 s wall on
+the grader, which runs ~1.5x slower than this VM (see NOTES.md for why the
+budget is 35 s here, not 42 s). Runs of the final file: 33.5 s and 35.5 s.
+
+| image | theme | bytes | points |
+|-------|-------|-------|--------|
+| i001 | flat | 11,837 | 750.8 |
+| i002 | rich | 48,147 | 750.4 |
+| i003 | alpha | 99,861 | 716.3 |
+| i004 | grey | 100,387 | 727.8 |
+| i005 | flat | 16,183 | 755.4 |
+| i006 | rich | 173,140 | 710.4 |
+| i007 | alpha | 59,346 | 717.9 |
+| i008 | grey | 23,872 | 739.7 |
 
 ## How it works
 
-Per image: decode the input PNG to RGBA, analyse it (opaque? grey? how many
-colours? a single transparent tRNS key?), try the lossless forms that can
-hold it (palette in three orders, grey / grey+alpha, RGB with a tRNS key,
-RGBA) with several per-row filter assignments (fixed 0/1/2/4, minimum-sum,
-fewest-pairs, brute force, and multi-band for RGB forms: a different
-strategy per horizontal band). Every candidate is weighed with zlib at
-level 6; the winner is written with our own deflate encoder: a hash-chain
-match finder with a carried match, a shortest-path (DP) parse minimising
-the deflate bit cost, and a choice of fixed Huffman, one dynamic block, or
-dynamic blocks split at DP-chosen points.
+1. Decode the input PNG to RGBA (any colour type 0/2/3/4/6, bit depth 8).
+2. Analyse it (opaque? grey? distinct colours? a single transparent key?).
+3. Try the lossless forms that can hold it (palette in three orders,
+   grey / grey+alpha, RGB with a tRNS key, RGBA) with several per-row
+   filter assignments (fixed 0/1/2/4, brute force weighed by a small zlib
+   run, and multi-band for RGB: a different strategy per horizontal band).
+   Weigh every candidate with zlib level 6; the smallest wins the screen.
+4. Write the winner with our own deflate encoder: a hash-chain match
+   finder (chain 128, short-chain 32, at most 6 length-beating candidates,
+   3-byte prefix so length-3 matches are found, carried match), a
+   shortest-path (dynamic programming) parse minimising the deflate bit
+   cost, and emission as fixed Huffman, one dynamic block, or dynamic
+   blocks split at DP-chosen points. Two passes: a greedy frequency
+   estimate, then one optimal parse.
 
-## v6 vs v5
+v7 over v6: the finder is cut from chain 512 to 128 (the parse calls it at
+every position, so the chain walk dominates the runtime) and the 'minsum'
+and 'pairs' filter choices are dropped from the screen (they never win it).
+That trades ~4,400 points for ~8 s — the time v6 needed to survive the
+grader. See NOTES.md for the measurements behind every choice.
 
-v5 scored 742,905 but ran 50.4-54.0 s here — it would time out on the
-grader, like v3 did. v6 cuts the finder back from 1024/8/64 to 512/6/32
-(chain 512, at most 6 candidates, short-chain 32) and keeps everything
-else: the 3-byte prefix fix, DP block splitting, RGB-only multi-band
-filters. The short chain is the cheap win (+3,600 points for ~+2 s over
-512/4/8). Score 738,024 at 41.5 s: safer, and still +11,623 over the
-submitted v2 (726,401).
+## Verification
 
-## Files
-
-- `main.ts` — the deliverable (Node 22, standard library only).
-- `LICENSE` — MIT.
-- `NOTES.md` — per-instance results, per-lever measurements, and why
-  v3/v4/v5 were not submittable.
+- All 8 practice images decode pixel-identical to the reference (kit
+  checker decoder, diff = 0), two full runs byte-identical.
+- Deterministic: fixed choices, fixed hash seeds, no clock reads.
