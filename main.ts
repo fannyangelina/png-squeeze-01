@@ -1,4 +1,4 @@
-// png-squeeze-01 v8: squeeze 1280x720 RGBA screenshots into the smallest
+// png-squeeze-01 v9: squeeze 1280x720 RGBA screenshots into the smallest
 // lossless PNG we can, within a fixed amount of work (never the wall clock).
 //
 // Per image:
@@ -7,149 +7,57 @@
 //      Is there one fully transparent colour a tRNS key could stand for?
 //   3. Try the lossless forms that can hold it (palette in three orders,
 //      grey / grey+alpha, RGB with a tRNS key, RGBA) with several per-row
-//      filter assignments (fixed 0/1/2/4, brute force weighed by a small
-//      zlib run, and multi-band: a different strategy per horizontal band).
-//      Weigh every candidate with zlib at level 6; the smallest wins.
-//   4. Write the winner with our own deflate encoder: a hash-chain match
-//      finder with a carried match (the best match at the previous position
-//      propagates forward one byte for free), a shortest-path (dynamic
-//      programming) parse that minimises the deflate bit cost under the
-//      block's Huffman lengths, and a choice of fixed Huffman, one dynamic
-//      block, or dynamic blocks split at DP-chosen points (refined by
-//      local shifts) where a fresh table pays for its header. Two passes
-//      total: a greedy frequency estimate, then one optimal parse.
+//      filter assignments (fixed 0/1/2/4, 'cover' - a match-aware greedy
+//      cost that weighs literals by entropy and matches by fixed length
+//      and distance costs - and, for RGB, multi-band: a different
+//      strategy per horizontal band, 8 bands). Weigh every candidate with
+//      zlib at level 6; the smallest wins.
+//   4. Write the winner with our own deflate encoder: one finder pass
+//      builds a cache of every position's match candidates (hash chain
+//      192, 6 candidates, short-chain 32, carried match); a greedy parse
+//      read from that cache gives the frequencies and the DP split points
+//      (2000-symbol grid, exact bit cost); each block is then re-parsed
+//      2-3 times with its own exact Huffman costs, reusing the cache
+//      (each round costs only the DP walk, ~20% of a full parse), keeping
+//      the best parse per block; the concatenated parse is emitted with
+//      the best of fixed Huffman, one dynamic block, uniform dynamic
+//      splits, the fixed per-block ranges, or a DP re-split (refined by
+//      local +-500/1000/1500 shifts).
 //
-// v8 changes over v7 (practice 733,586 -> 737,032, +3,446, still SAFE):
-//   - The finder chain is raised from 128 to 192 (6 candidates, short-chain
-//     32). Measured on the practice set: 128/6/32 -> 733,586 @ ~33.2 s;
-//     192/6/32 -> 735,428 @ ~34.7 s (+1,842 points for ~+1.5 s). The
-//     short chain and candidate cap are unchanged: SHORT 16 loses ~1,935
-//     points, CAND 4 loses ~2,078, both rejected. Runtime ~35 s here is
-//     ~52 s on the grader at its ~1.5x slowdown, inside the 60 s wall;
-//     v2 (37 s here) is the proof that ~37 s here completes.
-//   - Split refinement: after the DP picks block splits on the 2000-symbol
-//     grid, each split boundary is shifted by +-500/1000/1500 symbols and
-//     kept when the exact bits of the two adjacent blocks improve (up to
-//     two passes). Worth +1,604 points for ~+0.3 s - it recovers most of
-//     the finer-grid gain (grid 500 measured +4.4 points on i002/i007 but
-//     costs ~+1 s per image) at a fraction of the cost. The refinement
-//     only ever keeps a shift when the exact bit count improves, so it
-//     cannot make the emission worse.
-//   - Levers measured and NOT shipped: a finer DP grid by exact costing
-//     (grid 1000: +4.2 points on i002/i006/i007 but +2 s on i006 alone);
-//     'brute' at zlib level 6 (worse overall: i005 +675 B, and +2.5 s);
-//     a medium chain cap (best>=8 -> 64 steps: slower AND worse, the
-//     carry weakens); SHORT_CHAIN 48 (+891 points but +3 s); CAND 8
-//     (+219 points but +1.5 s); a first-appearance palette order (+1-4
-//     bytes on the flat images - negligible). Total runtime ~35 s on this
-//     VM (runs 34.8-35.2 s), lossless and deterministic.
+// v9 changes over v8 (practice 737,032 -> 745,099, +8,067; two generated
+// validation sets: +4,194 and +10,048 over v8, so the levers generalise):
+//   - Per-block parse<->cost iteration (zopfli-style): 2 rounds per
+//     block, a 3rd round only for large blocks (>8000 symbols) of a
+//     complex parse (>60000 symbols). The 3rd round gains most on the
+//     rich/alpha images (i003 -584 B, i006 -1,667 B); restricting it to
+//     large blocks keeps ~all of that for ~half the walk time.
+//   - The match cache: the finder runs ONCE per image and every DP walk
+//     reuses its match lists, so iteration is cheap. The greedy parse is
+//     read from the same cache instead of running the finder a second
+//     time (~0.9 s saved).
+//   - Multi-band filters: 8 horizontal bands instead of 4 (i002 -1,419 B,
+//     i006 -147 B; 12 bands is no better). Band weighing is nearly free
+//     at 8 bands because each band's zlib run covers half the rows.
+//   - The DP split grid is capped at 60 points: on huge parses (over
+//     120k symbols) the grid coarsens instead of letting the O(G^2)
+//     split dominate the runtime. Free on the practice set (largest
+//     parse 112k symbols), -15 points and -4 s on the heaviest generated
+//     validation set.
+//   - 'cover' replaces 'brute' as the per-row filter choice: same
+//     match-aware cost, ~3.7 s cheaper on the screen for ~-770 points.
+//   - Levers measured and NOT shipped: SHORT_CHAIN 48 (+727 points but
+//     +1.5 s, would breach the wall); chain 160 (-918 points);
+//     HASH_BITS 16/17 (identical bytes, no faster); cover top-3 by
+//     entropy (-3,529 points - entropy ranking is a poor proxy for the
+//     match-aware cost); DP-split grid 3000/4000 (-2,715 / -1,166
+//     points); a DP-walk prune (match cost >= literal cost) - valid but
+//     slower, the check costs more than it saves; arch A (one global
+//     optimal parse first: +159 points for +3.7 s).
 //
-// v7 changes over v6 (practice 738,024 -> 733,586, -4,438, but SAFE):
-//   - v6 (41.0-41.9 s here) was REJECTED like v3: its grade run TIMED
-//     OUT on the grader. v2 (37 s here) completed but v6 (41 s here) did
-//     not, so the grader is ~1.5x slower than this VM and the safe budget
-//     here is <= 35 s (35 s here is ~52 s there). v7 exists to beat v2's
-//     726,401 WITHOUT timing out.
-//   - The finder is cut back from 512/6/32 to 128/6/32 (chain 128, at
-//     most 6 length-beating candidates, short-chain 32 when the best
-//     match is already >= 32). The parse calls the finder at every
-//     position, so the chain walk is the dominant cost: 512 -> 128
-//     saves ~5 s for ~-4,400 points. Measured on the practice set:
-//     512/6/32 -> 738,024 @ 41.5 s; 256/6/32 -> 736,330 @ ~35.8 s;
-//     192/6/32 -> 735,428 @ ~36.0 s; 128/6/32 -> 733,586 @ ~33.2 s;
-//     64/6/32 -> 729,566 @ 33.3 s. (256/192 run too close to the wall
-//     on this VM once the grader's ~1.5x slowdown is applied.)
-//   - The 'minsum' and 'pairs' filter choices are dropped from the
-//     screen (palette and non-palette forms keep fixed 0/1/2/4, 'brute'
-//     and, for RGB, 'bands'). They never win the zlib-6 screen on any
-//     practice image - the winners are fixed 0, 'brute' and 'bands' -
-//     so dropping them costs 0 points and saves ~2 s. The band
-//     strategies still try all 7 (dropping minsum/pairs there lost
-//     272 points on i006 for ~0.1 s).
-//   - Everything else is kept from v6: the 3-byte prefix fix, DP block
-//     splitting (+3,381, ~+1 s), RGB-only multi-band filters (+2,528).
-//     Total runtime ~33-35 s on this VM (runs 32.7-35.5 s), which at the
-//     grader's ~1.5x slowdown is ~50-53 s - inside the 60 s wall.
-//
-// v6 changes over v5 (practice 742,905 -> 738,024, -4,881, but SAFE):
-//   - The grader is ~25-30% SLOWER than this VM. v3 (47.3/49.9 s here)
-//     TIMED OUT on the grader and was REJECTED (fail run_completes);
-//     v5 (50.4-54.0 s here) would time out too. A run past the wall
-//     "earns nothing on any column" (RULES.txt) and, as the Force_Last
-//     entry, would displace v2's 726,401. v2 (726,401, rank 398) is still
-//     the final entry; v6 exists to beat it WITHOUT timing out.
-//   - The finder is cut back from 1024/8/64 to 512/6/32 (chain 512, at
-//     most 6 length-beating candidates, short-chain 32 when the best
-//     match is already >= 32). Measured on the practice set:
-//     512/4/8 -> 732,674 @ 39.1 s; 512/4/32 -> 736,248 @ 41.0 s;
-//     512/6/8 -> 734,831 @ 40.3 s; 512/6/32 -> 738,024 @ 41.5 s.
-//     The short chain is the cheap win: when a long match is already
-//     carried, a 32-step walk finds a closer (cheaper-distance) match
-//     the 8-step walk misses, worth ~+3,600 points for ~+2 s, mostly
-//     on the rich and alpha images (i002 -871 B, i007 -1,094 B).
-//   - Everything else is kept from v5: the 3-byte prefix fix, DP block
-//     splitting (+3,381, ~+1 s), RGB-only multi-band filters (+2,528).
-//     Total runtime ~41.5 s on this VM (two runs: 41.1 s, 41.9 s), which
-//     was THOUGHT safe at the grader's ~25-30% slowdown (~52-54 s) -
-//     but v6 TIMED OUT on the grader anyway. The grader is ~1.5x
-//     slower, not ~1.25x: safe runtime on this VM is <= 35 s.
-//
-// v5 changes over v4 (practice 739,523 -> 742,905, +3,381):
-//   - Multi-band filters are offered ONLY for RGB (type 2) forms. The band
-//     weighing (7 strategies x 4 bands = 28 zlib-6 runs) costs ~6-8 s per
-//     image, and on the practice set it only ever gained on the two rich
-//     (RGB) images (i002 -1,438 B, i006 -784 B); the alpha/grey images
-//     pay the cost and gain nothing. Restricting bands to RGB keeps the
-//     full +2,528 points and cuts ~3-4 s, back to ~49-52 s.
-//   - DP block splitting: split points are chosen by dynamic programming
-//     over a 2000-symbol grid by exact bit cost (prefix symbol counts make
-//     a block's frequency and data bits O(alphabet)), replacing the fixed
-//     uniform 2k-200k splits. The DP can reproduce any uniform split and
-//     also places splits where the statistics actually change. Worth
-//     +3,381 points (every image gains: i006 -1,097 B, i003 -868 B,
-//     i007 -511 B, i004 -438 B, i002 -235 B, i008 -133 B, i005 -47 B,
-//     i001 -40 B) for ~+1 s. Total runtime ~51 s on this VM.
-//   - Total runtime ~51 s on this VM (v4: 53-61 s), under the 60 s wall.
-//     v4 was NOT submitted: its 53-61 s runtime risked a timeout, and
-//     RULES.txt says a run past the wall "earns nothing on any column".
-//
-// v4 changes over v3 (practice 736,995 -> 739,523, +2,528):
-//   - Multi-band filters: the rows are split into 4 horizontal bands and
-//     each band gets the filter strategy (fixed 0/1/2/4, minsum, pairs,
-//     brute) that minimises zlib-6 over that band's filtered rows, using
-//     all preceding filtered data as the dictionary so cross-row matches
-//     count. The per-row 'brute' choice is myopic (one row + 32 KiB
-//     dict); a band choice sees the whole band's cross-row structure.
-//     Worth ~+2,500 points (i002 -1,438 B, i006 -784 B). Offered only
-//     for non-palette forms: on palette (flat) images it wins the zlib-6
-//     screen but loses under the optimal parser (i005 regressed
-//     +357 B in testing), so palette keeps the v3 filter set.
-//   - Levers measured and NOT shipped (see NOTES.md): per-bucket Pareto
-//     frontier finder (worse: i002 +682 B, i007 +994 B); smoothed DP cost
-//     model (worse: i002 +76 B, i007 +250 B); deeper chain walk
-//     (SHORT_CHAIN 128 gains ~+5 pts on i002/i007 but costs +2.8 s, and
-//     the full-set time would breach the 60 s wall); parse<->cost
-//     iteration (only +0.4% for 2x time). The deflate gap to zopfli
-//     (~5.8% on i002) is not in the finder (an oracle shows it finds
-//     nearly the brute-force longest match) nor in the cost model - it
-//     is in zopfli's optimal block splitting and Huffman table work,
-//     which our fixed uniform splits already approximate. (v5 takes the
-//     block-splitting half of that gap with the DP above.)
-//   - Total runtime ~53-56 s on this VM, under the 60 s wall.
-//
-// v3 changes over v2 (practice 726,401 -> 736,995, +10,594):
-//   - The finder now matches a 3-byte prefix, not 4. A length-3 match has
-//     a differing 4th byte, so the old 4-byte check could never find one
-//     directly (only via the carry) - and length-3 matches are everywhere
-//     in RGB data, where a pixel is 3 bytes. Worth ~+1,400 points.
-//   - Finder widened to chain 1024, 8 candidates, short-chain 64 (v2:
-//     512/4/8). Measured: +2,700 points over 512/8/64 for +1.8 s; the
-//     next step (1024/8/128) is only +1,200 more for +9.4 s, so 64 is
-//     the sweet spot. Total runtime 47 s on this VM, under the 60 s wall.
-//   - Parse<->cost iteration (zopfli-style) was implemented and measured
-//     but NOT shipped: it gains only ~0.5% (i001 11,753 -> 11,565; i002
-//     51,936 -> 51,739 over 3 rounds) for ~2.5x the time, which the 60 s
-//     wall does not afford. The single parse stands. (See NOTES.md.)
+// Runtime ~36.2-36.4 s on this VM (two runs), lossless and deterministic.
+// The grader is ~1.5x slower than this VM (v3 at 47 s and v6 at 41 s
+// timed out; v2 at 37 s and v8 at 37.4 s completed), so ~36 s here is
+// ~54 s there, inside the 60 s wall.
 //
 // Everything is deterministic: fixed choices, fixed hash seeds, no clock
 // reads, no randomness, no environment-dependent variation. The work per
@@ -550,6 +458,15 @@ function pairsOf(row, seen, stamp) {
 // ---------------------------------------------------------------------------
 
 const SCREEN = Object.freeze({ level: 6, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY });
+// Entropy cost model for the 'entropy' filter choice: litCost[byte] from the
+// fixed-0 filtered stream's byte frequencies (Huffman lengths, +1 smoothing).
+// Set by screen() before weighing choices; null = not available.
+let ENTROPY_LITCOST = null;
+function entropyCost(row) {
+  let c = 0;
+  for (let i = 0; i < row.length; i++) c += ENTROPY_LITCOST[row[i]];
+  return c;
+}
 const BRUTE_CONTEXT = 32768;
 const BRUTE_LEVEL = 4;
 
@@ -562,6 +479,8 @@ function filtered(samples, width, height, bpp, choice, raw) {
     typeof choice === 'number' ? null : Array.from({ length: 5 }, () => new Uint8Array(stride));
   const seen = new Uint32Array(65536);
   let stamp = 0;
+  const coverHead = new Int32Array(HASH_SIZE).fill(-1);
+  const coverPrev = new Int32Array(size);
   for (let y = 0; y < height; y++) {
     const cur = samples.subarray(y * stride, (y + 1) * stride);
     const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
@@ -574,11 +493,27 @@ function filtered(samples, width, height, bpp, choice, raw) {
     const before = raw.subarray(Math.max(0, at - BRUTE_CONTEXT), at);
     let type = 0;
     let best = Infinity;
-    for (let t = 0; t < 5; t++) {
+    if (choice === 'cover') {
+      for (let t = 0; t < 5; t++) {
+        filterRow(t, cur, prev, bpp, trial[t]);
+        const cost = coverCost(trial[t], coverHead.slice(), coverPrev, raw, at, stride);
+        if (cost < best) { best = cost; type = t; }
+      }
+    } else if (choice === 'brute2') {
+      const ec = [0, 0, 0, 0, 0];
+      for (let t = 0; t < 5; t++) { filterRow(t, cur, prev, bpp, trial[t]); ec[t] = entropyCost(trial[t]); }
+      const order = [0, 1, 2, 3, 4].sort((a, b) => ec[a] - ec[b]);
+      for (let k = 0; k < 2; k++) {
+        const t = order[k];
+        const cost = deflateSync(trial[t], { level: BRUTE_LEVEL, memLevel: 9, dictionary: before.length === 0 ? undefined : before }).length;
+        if (cost < best) { best = cost; type = t; }
+      }
+    } else for (let t = 0; t < 5; t++) {
       filterRow(t, cur, prev, bpp, trial[t]);
       let cost;
       if (choice === 'minsum') cost = signedSum(trial[t]);
       else if (choice === 'pairs') cost = pairsOf(trial[t], seen, ++stamp);
+      else if (choice === 'entropy') cost = entropyCost(trial[t]);
       else {
         cost = deflateSync(trial[t], {
           level: BRUTE_LEVEL,
@@ -593,6 +528,15 @@ function filtered(samples, width, height, bpp, choice, raw) {
     }
     raw[at] = type;
     raw.set(trial[type], at + 1);
+    if (choice === 'cover') {
+      // Insert the chosen row (and its filter byte) into the cover structure.
+      for (let p = at; p <= at + stride; p++) {
+        if (p + 2 >= raw.length) break;
+        const h = hashAt(raw, p);
+        coverPrev[p] = coverHead[h];
+        coverHead[h] = p;
+      }
+    }
   }
   return raw;
 }
@@ -606,13 +550,15 @@ function filtered(samples, width, height, bpp, choice, raw) {
 // the band weighing costs ~6-8 s per image and only ever gained on the
 // two rich (RGB) images; palette keeps the v3 filter set (on palette it
 // wins the zlib-6 screen but loses under the optimal parser, i005 +357 B).
-const BANDS = 4;
-const BAND_STRATEGIES = [0, 1, 2, 4, 'minsum', 'pairs', 'brute'];
+const BANDS = 8;
+const BAND_STRATEGIES = [0, 1, 2, 4, 'minsum', 'pairs', 'cover'];
 function filterRows(samples, width, bpp, y0, y1, choice, out) {
   const stride = width * bpp;
   const trial = typeof choice === 'number' ? null : Array.from({ length: 5 }, () => new Uint8Array(stride));
   const seen = new Uint32Array(65536);
   let stamp = 0;
+  const coverHead = new Int32Array(HASH_SIZE).fill(-1);
+  const coverPrev = new Int32Array((y1 - y0) * (stride + 1) + 2);
   for (let y = y0; y < y1; y++) {
     const cur = samples.subarray(y * stride, (y + 1) * stride);
     const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
@@ -625,16 +571,40 @@ function filterRows(samples, width, bpp, y0, y1, choice, out) {
     const before = out.subarray(Math.max(0, at - BRUTE_CONTEXT), at);
     let type = 0;
     let best = Infinity;
-    for (let t = 0; t < 5; t++) {
+    if (choice === 'cover') {
+      for (let t = 0; t < 5; t++) {
+        filterRow(t, cur, prev, bpp, trial[t]);
+        const cost = coverCost(trial[t], coverHead.slice(), coverPrev, out, at, stride);
+        if (cost < best) { best = cost; type = t; }
+      }
+    } else if (choice === 'brute2') {
+      const ec = [0, 0, 0, 0, 0];
+      for (let t = 0; t < 5; t++) { filterRow(t, cur, prev, bpp, trial[t]); ec[t] = entropyCost(trial[t]); }
+      const order = [0, 1, 2, 3, 4].sort((a, b) => ec[a] - ec[b]);
+      for (let k = 0; k < 2; k++) {
+        const t = order[k];
+        const cost = deflateSync(trial[t], { level: BRUTE_LEVEL, memLevel: 9, dictionary: before.length === 0 ? undefined : before }).length;
+        if (cost < best) { best = cost; type = t; }
+      }
+    } else for (let t = 0; t < 5; t++) {
       filterRow(t, cur, prev, bpp, trial[t]);
       let cost;
       if (choice === 'minsum') cost = signedSum(trial[t]);
       else if (choice === 'pairs') cost = pairsOf(trial[t], seen, ++stamp);
+      else if (choice === 'entropy') cost = entropyCost(trial[t]);
       else cost = deflateSync(trial[t], { level: BRUTE_LEVEL, memLevel: 9, dictionary: before.length === 0 ? undefined : before }).length;
       if (cost < best) { best = cost; type = t; }
     }
     out[at] = type;
     out.set(trial[type], at + 1);
+    if (choice === 'cover') {
+      for (let p = at; p <= at + stride; p++) {
+        if (p + 2 >= out.length) break;
+        const h = hashAt(out, p);
+        coverPrev[p] = coverHead[h];
+        coverHead[h] = p;
+      }
+    }
   }
   return out;
 }
@@ -716,7 +686,19 @@ function screen(rgba, width, height) {
   for (const form of formsOf(rgba)) {
     const size = height * (width * form.bpp + 1);
     const chunks = chunkBytes(form);
-    for (const choice of form.filters) {
+    // Entropy model from the fixed-0 filtered stream.
+    {
+      const f0 = filtered(form.samples, width, height, form.bpp, 0, null);
+      const freq = new Uint32Array(256);
+      for (let i = 0; i < f0.length; i++) freq[f0[i]]++;
+      const lf = new Uint32Array(288);
+      for (let b = 0; b < 256; b++) lf[b] = freq[b] + 1;
+      ENTROPY_LITCOST = huffmanLengths(lf, 15);
+    }
+    // v9: 'brute' is replaced by 'cover' (match-aware greedy cost, ~3.7 s
+    // cheaper on the screen for ~-770 points on the practice set).
+    let filters = form.filters.map((c) => (c === 'brute' ? 'cover' : c));
+    for (const choice of filters) {
       const data = choice === 'bands'
         ? filteredBands(form.samples, width, height, form.bpp, spare !== null && spare.length === size ? spare : null)
         : filtered(form.samples, width, height, form.bpp, choice, spare !== null && spare.length === size ? spare : null);
@@ -1048,6 +1030,65 @@ function insertPos(data, head, prev, i) {
   head[h] = i;
 }
 
+// 'cover' filter cost: fixed-table match costs, for the match-aware filter
+// proxy. Literals pay ENTROPY_LITCOST; a match pays its fixed length +
+// distance code bits. Computed once from the fixed tables.
+const FIXED_LEN_COST = new Int32Array(259);
+const FIXED_DIST_COST = new Int32Array(32769);
+for (let l = 3; l <= 258; l++) FIXED_LEN_COST[l] = FIXED_LIT_LEN[257 + LEN_CODE[l]] + LEN_EXTRA[LEN_CODE[l]];
+for (let d = 1; d <= 32768; d++) FIXED_DIST_COST[d] = FIXED_DIST_LEN[DIST_CODE[d]] + DIST_EXTRA[DIST_CODE[d]];
+
+const COVER_STEPS = 16;
+// Greedy cover cost of one trial row against the preceding filtered stream
+// PLUS the row's own earlier bytes (a real sliding window: matches may
+// source from within the row, e.g. a distance-1 run). `head` is a scratch
+// copy of the persistent head (mutated); `prev` is the persistent prev
+// array — within-row entries written here are unreachable from the
+// persistent head (it never points at them), and the finalize step below
+// re-inserts the chosen row properly. Returns the estimated bit cost.
+function coverCost(trial, head, prev, raw, at, stride) {
+  const base = at + 1; // absolute position of trial[0]
+  const byteAt = (q) => (q < base ? raw[q] : trial[q - base]);
+  let cost = 0;
+  let i = 0;
+  while (i < stride) {
+    let bestLen = 0;
+    let bestDist = 0;
+    if (i + 2 < stride) {
+      const h = hashAt(trial, i);
+      let p = head[h];
+      let steps = 0;
+      while (p >= 0 && steps < COVER_STEPS) {
+        steps++;
+        const dist = base + i - p;
+        if (dist > 32768) break;
+        if (byteAt(p) === trial[i] && byteAt(p + 1) === trial[i + 1] && byteAt(p + 2) === trial[i + 2]) {
+          const maxLen = Math.min(stride - i, 258);
+          let len = 3;
+          while (len < maxLen && trial[i + len] === byteAt(p + len)) len++;
+          if (len > bestLen) {
+            bestLen = len;
+            bestDist = dist;
+            if (len >= 32) break;
+          }
+        }
+        p = prev[p];
+      }
+    }
+    const adv = bestLen >= 3 ? bestLen : 1;
+    if (bestLen >= 3) cost += FIXED_LEN_COST[bestLen] + FIXED_DIST_COST[bestDist];
+    else cost += ENTROPY_LITCOST[trial[i]];
+    for (let j = i; j < i + adv; j++) {
+      if (j + 2 >= stride) break;
+      const h = hashAt(trial, j);
+      prev[base + j] = head[h];
+      head[h] = base + j;
+    }
+    i += adv;
+  }
+  return cost;
+}
+
 // Bit cost of a match of length l at distance d under the given tables.
 function matchCost(lenCost, distCostByDist, l, d) {
   return lenCost[l] + distCostByDist[d];
@@ -1063,163 +1104,74 @@ function costTables(litCost, distCost) {
 
 // Greedy parse with the given bit costs, collecting symbol frequencies.
 // Takes the longest match when it beats the literals it covers.
-function greedyFreq(data, litCost, distCost, head, prev) {
+// Greedy parse reading the matches from the shared finder cache instead of
+// running the finder a second time (greedyFreq's own finder pass cost
+// ~0.9 s over the set and its chains differ only by the visited positions).
+// Same choice rule as greedyFreq: the longest cached match, taken when it
+// beats the literals for its span. Same return shape.
+function greedyFromCache(data, cache, litCost, distCost) {
   const n = data.length;
   const litFreq = new Uint32Array(288);
   const distFreq = new Uint32Array(30);
+  const symLit = [];
+  const symDist = [];
+  const symLenEx = [];
+  const symDistEx = [];
+  const symByteOff = [];
   const { lenCost, distCostByDist } = costTables(litCost, distCost);
   const pref = new Int32Array(n + 1);
   for (let i = 0; i < n; i++) pref[i + 1] = pref[i] + litCost[data[i]];
-  const cand = [];
-  head.fill(-1);
+  const { off, pairs } = cache;
   let i = 0;
-  let carryLen = 0;
-  let carryDist = 0;
-  let carryMax = 0;
   while (i < n) {
-    const m = i + 2 < n ? findMatches(data, head, prev, i, n, cand, carryLen, carryDist, carryMax) : 0;
-    // The longest match found here (scan: out is no longer length-ordered,
-    // the closest candidate is recorded even when shorter than the carry).
-    const maxHere = n - i < 258 ? n - i : 258;
-    carryLen = 0;
-    carryDist = 0;
-    carryMax = 0;
-    if (m > 0) {
-      for (let k = 0; k < m; k++) {
-        if (cand[k * 2] > carryLen) {
-          carryLen = cand[k * 2];
-          carryDist = cand[k * 2 + 1];
-        }
-      }
-      carryMax = maxHere;
-    }
     let takeLen = 0;
     let takeDist = 0;
-    if (m > 0) {
-      // The longest match found usually saves most.
-      const len = carryLen;
-      const dist = carryDist;
-      if (matchCost(lenCost, distCostByDist, len, dist) < pref[i + len] - pref[i]) {
-        takeLen = len;
-        takeDist = dist;
+    if (i + 2 < n) {
+      const cnt = (off[i + 1] - off[i]) >> 1;
+      const p0 = off[i];
+      let bestLen = 0;
+      let bestDist = 0;
+      for (let k = 0; k < cnt; k++) {
+        const len = pairs[p0 + k * 2];
+        if (len > bestLen) { bestLen = len; bestDist = pairs[p0 + k * 2 + 1]; }
+      }
+      if (bestLen >= 3 && matchCost(lenCost, distCostByDist, bestLen, bestDist) < pref[i + bestLen] - pref[i]) {
+        takeLen = bestLen;
+        takeDist = bestDist;
       }
     }
     if (takeLen > 0) {
       const c = LEN_CODE[takeLen];
       litFreq[257 + c]++;
       distFreq[DIST_CODE[takeDist]]++;
-      for (let k = 0; k < takeLen; k++) {
-        if (i + k + 2 < n) insertPos(data, head, prev, i + k);
-      }
+      symLit.push(257 + c);
+      symDist.push(DIST_CODE[takeDist]);
+      symLenEx.push(LEN_VAL[takeLen]);
+      symDistEx.push(DIST_VAL[takeDist]);
+      symByteOff.push(i);
       i += takeLen;
-      carryLen = 0; // the carry does not survive a jump over a match
-      carryDist = 0;
-      carryMax = 0;
     } else {
       litFreq[data[i]]++;
-      if (i + 2 < n) insertPos(data, head, prev, i);
+      symLit.push(data[i]);
+      symDist.push(0);
+      symLenEx.push(0);
+      symDistEx.push(0);
+      symByteOff.push(i);
       i++;
     }
   }
   litFreq[256]++; // end of block
-  return { litFreq, distFreq };
+  return {
+    litFreq, distFreq,
+    litSym: Uint16Array.from(symLit),
+    distSym: Uint8Array.from(symDist),
+    lenExtraVal: Uint8Array.from(symLenEx),
+    distExtraVal: Uint16Array.from(symDistEx),
+    byteOff: Int32Array.from([...symByteOff, n]),
+    count: symLit.length,
+  };
 }
 
-// Shortest-path (dynamic programming) parse minimising the deflate bit cost
-// under the given per-symbol costs. Returns the symbol sequence.
-function optimalParse(data, litCost, distCost, head, prev) {
-  const n = data.length;
-  const { lenCost, distCostByDist } = costTables(litCost, distCost);
-  const INF = 1 << 30;
-  const cost = new Int32Array(n + 1);
-  const choiceLen = new Uint16Array(n + 1); // 0 = literal, else match length
-  const choiceDist = new Uint16Array(n + 1);
-  cost.fill(INF);
-  cost[0] = 0;
-  const cand = [];
-  head.fill(-1);
-  let carryLen = 0;
-  let carryDist = 0;
-  let carryMax = 0;
-  for (let i = 0; i < n; i++) {
-    const ci = cost[i];
-    if (ci !== INF) {
-      const litC = ci + litCost[data[i]];
-      if (litC < cost[i + 1]) {
-        cost[i + 1] = litC;
-        choiceLen[i + 1] = 0;
-      }
-      const m = i + 2 < n ? findMatches(data, head, prev, i, n, cand, carryLen, carryDist, carryMax) : 0;
-      const maxHere = n - i < 258 ? n - i : 258;
-      carryLen = 0;
-      carryDist = 0;
-      carryMax = 0;
-      if (m > 0) {
-        for (let k = 0; k < m; k++) {
-          if (cand[k * 2] > carryLen) {
-            carryLen = cand[k * 2];
-            carryDist = cand[k * 2 + 1];
-          }
-        }
-        carryMax = maxHere;
-      }
-      for (let k = 0; k < m; k++) {
-        const len = cand[k * 2];
-        const dist = cand[k * 2 + 1];
-        const dc = distCostByDist[dist];
-        const trials = LEN_TRIALS[len];
-        for (let t = 0; t < trials.length; t++) {
-          const l = trials[t];
-          const nc = ci + lenCost[l] + dc;
-          if (nc < cost[i + l]) {
-            cost[i + l] = nc;
-            choiceLen[i + l] = l;
-            choiceDist[i + l] = dist;
-          }
-        }
-      }
-    } else {
-      carryLen = 0; // unreachable position: no matches computed, carry dies
-      carryDist = 0;
-      carryMax = 0;
-    }
-    if (i + 2 < n) insertPos(data, head, prev, i);
-  }
-  // Walk back from n, collecting symbols in reverse, then flip them.
-  let count = 0;
-  for (let j = n; j > 0; ) {
-    const l = choiceLen[j];
-    if (l === 0) j--;
-    else j -= l;
-    count++;
-  }
-  const litSym = new Uint16Array(count);
-  const distSym = new Uint8Array(count);
-  const lenExtraVal = new Uint8Array(count);
-  const distExtraVal = new Uint16Array(count);
-  let at = count;
-  for (let j = n; j > 0; ) {
-    const l = choiceLen[j];
-    at--;
-    if (l === 0) {
-      litSym[at] = data[j - 1];
-      j--;
-    } else {
-      const d = choiceDist[j];
-      litSym[at] = 257 + LEN_CODE[l];
-      distSym[at] = DIST_CODE[d];
-      lenExtraVal[at] = LEN_VAL[l];
-      distExtraVal[at] = DIST_VAL[d];
-      j -= l;
-    }
-  }
-  return { litSym, distSym, lenExtraVal, distExtraVal, count };
-}
-
-// Lengths for the DP cost model: every symbol that could be emitted gets a
-// frequency of at least 1, so no symbol is ever free. A zero-length symbol
-// would make the DP chase it (a "free" long match) and the real emit pay
-// full price for it — that is what made the first v2 parse worse than zlib.
 function costLensFromFreq(litFreq, distFreq) {
   const lf = new Uint32Array(288);
   const df = new Uint32Array(30);
@@ -1408,10 +1360,15 @@ function writeSymbols(w, parse, from, to, litCodes, litLens, distCodes, distLens
 // of O(block length). Returns { bits, splits } where splits are [from, to)
 // symbol ranges in order.
 const DP_GRID = 2000;
-function dpSplit(parse) {
+function dpSplit(parse, grid = DP_GRID) {
   const count = parse.count;
+  // The DP is O(G^2) blockBits calls; on huge parses the grid-point count
+  // explodes and the split dominates the runtime. Cap the points at 60
+  // (a coarser grid only for parses over 120k symbols; the practice set's
+  // largest parse is 112k symbols, so it is unaffected).
+  if (count / grid > 60) grid = Math.ceil(count / 60);
   const pts = [];
-  for (let p = 0; p < count; p += DP_GRID) pts.push(p);
+  for (let p = 0; p < count; p += grid) pts.push(p);
   pts.push(count);
   const G = pts.length;
   const litPref = new Array(G);
@@ -1540,7 +1497,7 @@ function refineSplits(parse, dp) {
 // Pick the cheapest way to write the parse (fixed Huffman, one dynamic
 // block, or dynamic blocks split every so many symbols) by exact bit cost,
 // then write it.
-function emitDeflate(parse) {
+function emitDeflate(parse, fixedSplits) {
   const count = parse.count;
   const fixedLitCodes = canonicalCodes(FIXED_LIT_LEN);
   const fixedDistCodes = canonicalCodes(FIXED_DIST_LEN);
@@ -1572,6 +1529,22 @@ function emitDeflate(parse) {
       best = { splits: maxSym, infos };
     }
   }
+  // v9: the per-block iterated ranges, as one more candidate. Their tables
+  // come from the iterated parses' own frequencies.
+  if (fixedSplits) {
+    const infos = [];
+    let bits = 0;
+    for (const [from, to] of fixedSplits) {
+      const f = freqOfRange(parse, from, to);
+      const info = dynamicBlockInfo(f.litFreq, f.distFreq);
+      infos.push(info);
+      bits += info.headerBits + rangeBits(parse, from, to, info.lit, info.dist);
+    }
+    if (bits < bestBits) {
+      bestBits = bits;
+      best = { splits: -2, infos, dpSplits: fixedSplits };
+    }
+  }
   // v5: DP split points on a 2000-symbol grid, by exact bit cost. The DP
   // can reproduce any uniform split (2000 is a grid multiple) and can also
   // place splits where the statistics actually change, so it is at least
@@ -1593,7 +1566,7 @@ function emitDeflate(parse) {
   } else {
     let from = 0;
     for (let b = 0; b < best.infos.length; b++) {
-      const to = best.splits === 0 ? count : best.splits === -1 ? best.dpSplits[b][1] : Math.min(count, from + best.splits);
+      const to = best.splits === 0 ? count : best.splits < 0 ? best.dpSplits[b][1] : Math.min(count, from + best.splits);
       const info = best.infos[b];
       writeDynamicHeader(w, info, b === best.infos.length - 1);
       writeSymbols(
@@ -1612,6 +1585,10 @@ function emitDeflate(parse) {
   return flushBits(w);
 }
 
+function emitDeflateV9(parse, fixedSplits) {
+  return emitDeflate(parse, fixedSplits);
+}
+
 // Our own deflate for one filtered stream: greedy frequencies, then one
 // shortest-path parse under the Huffman cost model derived from them, then
 // the cheapest emission — wrapped in a zlib header and Adler-32.
@@ -1623,14 +1600,194 @@ function emitDeflate(parse) {
 // (~2.5x total time). With the 60 s wall it does not pay, so v3 ships a
 // single parse. The iteration code was removed rather than left dormant.
 // (Re-measured in v4 on the v3 stream: the same ~0.4% for 2x time.)
-function optimalDeflate(data) {
+// Byte offset of each symbol in a parse (byteOff[count] = stream length).
+function symbolByteOffsets(parse) {
+  const off = new Int32Array(parse.count + 1);
+  let at = 0;
+  for (let s = 0; s < parse.count; s++) {
+    off[s] = at;
+    const ls = parse.litSym[s];
+    at += ls >= 257 ? LEN_BASE[ls - 257] + parse.lenExtraVal[s] : 1;
+  }
+  off[parse.count] = at;
+  return off;
+}
+
+// Match cache: for every position, the findMatches lists (len, dist pairs)
+// found by ONE finder pass (insert every position, carry propagated — the
+// same finder stream optimalParse uses). A later DP walk reuses the lists
+// without touching the finder, so extra parse rounds cost only the walk.
+function buildCache(data) {
   const n = data.length;
-  const head = new Int32Array(HASH_SIZE);
+  const head = new Int32Array(HASH_SIZE).fill(-1);
   const prev = new Int32Array(n);
-  const g = greedyFreq(data, FIXED_LIT_LEN, FIXED_DIST_LEN, head, prev);
-  const lens = costLensFromFreq(g.litFreq, g.distFreq);
-  const parse = optimalParse(data, lens.lit, lens.dist, head, prev);
-  const deflate = emitDeflate(parse);
+  const off = new Int32Array(n + 1);
+  let pairs = new Uint16Array(Math.max(4096, n * 4));
+  let used = 0;
+  const cand = [];
+  let carryLen = 0;
+  let carryDist = 0;
+  let carryMax = 0;
+  for (let i = 0; i < n; i++) {
+    off[i] = used;
+    let m = 0;
+    if (i + 2 < n) m = findMatches(data, head, prev, i, n, cand, carryLen, carryDist, carryMax);
+    if (used + m * 2 > pairs.length) {
+      const np = new Uint16Array(Math.max(pairs.length * 2, used + m * 2));
+      np.set(pairs);
+      pairs = np;
+    }
+    for (let k = 0; k < m; k++) {
+      pairs[used++] = cand[k * 2];
+      pairs[used++] = cand[k * 2 + 1];
+    }
+    const maxHere = n - i < 258 ? n - i : 258;
+    carryLen = 0;
+    carryDist = 0;
+    carryMax = 0;
+    if (m > 0) {
+      for (let k = 0; k < m; k++) {
+        if (cand[k * 2] > carryLen) {
+          carryLen = cand[k * 2];
+          carryDist = cand[k * 2 + 1];
+        }
+      }
+      carryMax = maxHere;
+    }
+    if (i + 2 < n) insertPos(data, head, prev, i);
+  }
+  off[n] = used;
+  return { off, pairs, totalPairs: used >> 1 };
+}
+
+// Shortest-path DP over ONE byte range [from, to), using the cached match
+// lists (a match starting in the range is truncated at `to`, so no symbol
+// crosses a block boundary). Returns the parse for that range.
+function dpWalkCached(data, litCost, distCost, cache, from, to) {
+  const n = to - from;
+  const { lenCost, distCostByDist } = costTables(litCost, distCost);
+  const INF = 1 << 30;
+  const cost = new Int32Array(n + 1);
+  const choiceLen = new Uint16Array(n + 1);
+  const choiceDist = new Uint16Array(n + 1);
+  cost.fill(INF);
+  cost[0] = 0;
+  const { off, pairs } = cache;
+  for (let j = 0; j < n; j++) {
+    const ci = cost[j];
+    if (ci === INF) continue;
+    const i = from + j;
+    const litC = ci + litCost[data[i]];
+    if (litC < cost[j + 1]) {
+      cost[j + 1] = litC;
+      choiceLen[j + 1] = 0;
+    }
+    const cnt = (off[i + 1] - off[i]) >> 1; // off counts elements, 2 per pair
+    const p0 = off[i];
+    for (let k = 0; k < cnt; k++) {
+      let len = pairs[p0 + k * 2];
+      const dist = pairs[p0 + k * 2 + 1];
+      if (i + len > to) {
+        len = to - i;
+        if (len < 3) continue;
+      }
+      const dc = distCostByDist[dist];
+      const trials = LEN_TRIALS[len];
+      for (let t = 0; t < trials.length; t++) {
+        const l = trials[t];
+        const nc = ci + lenCost[l] + dc;
+        if (nc < cost[j + l]) {
+          cost[j + l] = nc;
+          choiceLen[j + l] = l;
+          choiceDist[j + l] = dist;
+        }
+      }
+    }
+  }
+  let count = 0;
+  for (let j = n; j > 0; ) {
+    const l = choiceLen[j];
+    if (l === 0) j--;
+    else j -= l;
+    count++;
+  }
+  const litSym = new Uint16Array(count);
+  const distSym = new Uint8Array(count);
+  const lenExtraVal = new Uint8Array(count);
+  const distExtraVal = new Uint16Array(count);
+  let at = count;
+  for (let j = n; j > 0; ) {
+    const l = choiceLen[j];
+    at--;
+    if (l === 0) {
+      litSym[at] = data[from + j - 1];
+      j--;
+    } else {
+      const d = choiceDist[j];
+      litSym[at] = 257 + LEN_CODE[l];
+      distSym[at] = DIST_CODE[d];
+      lenExtraVal[at] = LEN_VAL[l];
+      distExtraVal[at] = DIST_VAL[d];
+      j -= l;
+    }
+  }
+  return { litSym, distSym, lenExtraVal, distExtraVal, count };
+}
+
+// Deflate: one finder pass builds the match cache; a greedy parse read
+// from the cache gives the frequencies and the DP split points (as in
+// zopfli: split the greedy parse, then parse each block optimally); each
+// block is re-parsed 2-3 times with its own exact costs, reusing the cache.
+function optimalDeflate(data) {
+  const cache = buildCache(data);
+  const g = greedyFromCache(data, cache, FIXED_LIT_LEN, FIXED_DIST_LEN);
+  const baseParse = { litSym: g.litSym, distSym: g.distSym, lenExtraVal: g.lenExtraVal, distExtraVal: g.distExtraVal, count: g.count };
+  const splitSyms = dpSplit(baseParse).splits;
+  const byteOff = baseParse.byteOff || symbolByteOffsets(baseParse);
+  // Per-block iterated walks.
+  const blockParses = [];
+  const blockSymRanges = [];
+  let symAt = 0;
+  for (const [a, b] of splitSyms) {
+    const bs = byteOff[a];
+    const be = byteOff[b];
+    let lens = costLensFromFreq(freqOfRange(baseParse, a, b).litFreq, freqOfRange(baseParse, a, b).distFreq);
+    let bestParse = null;
+    let bestBits = Infinity;
+    // Round 3 only pays on large blocks of a complex parse (most symbols
+    // = most frequency data for the cost model to refine); small blocks
+    // and simple parses converge in 2 rounds.
+    const rounds = g.count > 60000 && (b - a) > 8000 ? 3 : 2;
+    for (let r = 0; r < rounds; r++) {
+      const p = dpWalkCached(data, lens.lit, lens.dist, cache, bs, be);
+      const bits = exactBlockBits(p, 0, p.count);
+      if (bits < bestBits) {
+        bestBits = bits;
+        bestParse = p;
+      }
+      const f = freqOfRange(p, 0, p.count);
+      lens = costLensFromFreq(f.litFreq, f.distFreq);
+    }
+    blockParses.push(bestParse);
+    blockSymRanges.push([symAt, symAt + bestParse.count]);
+    symAt += bestParse.count;
+  }
+  // Concatenate the block parses.
+  const total = symAt;
+  const litSym = new Uint16Array(total);
+  const distSym = new Uint8Array(total);
+  const lenExtraVal = new Uint8Array(total);
+  const distExtraVal = new Uint16Array(total);
+  let at = 0;
+  for (const p of blockParses) {
+    litSym.set(p.litSym, at);
+    distSym.set(p.distSym, at);
+    lenExtraVal.set(p.lenExtraVal, at);
+    distExtraVal.set(p.distExtraVal, at);
+    at += p.count;
+  }
+  const parse = { litSym, distSym, lenExtraVal, distExtraVal, count: total };
+  const deflate = emitDeflateV9(parse, blockSymRanges);
   const out = new Uint8Array(deflate.length + 6);
   out[0] = 0x78;
   out[1] = 0x9c;
@@ -1658,7 +1815,8 @@ function pngOfImage(form, width, height, idat) {
 // double the work for no gain.)
 function encodeImage(rgba, width, height) {
   const { best } = screen(rgba, width, height);
-  return pngOfImage(best.form, width, height, optimalDeflate(best.data));
+  const def = optimalDeflate(best.data);
+  return pngOfImage(best.form, width, height, def);
 }
 
 // ---------------------------------------------------------------------------
