@@ -1,3 +1,6 @@
+// png-squeeze-01 v11: v10 + 3 lever (MAX_CHAIN 192->256, SHORT_CHAIN 32->48,
+// skip palette forms pada gambar grey). Terverifikasi: practice 740.908, val1
+// 740.445, val2 739.527; lossless, deterministik. Runtime val2 ~37 dtk.
 // png-squeeze-01 v10: v9 with a deterministic runtime cut so the grade run
 // fits the grader wall on heavy sets. v9 (practice 745,099) was REJECTED:
 // its grade run timed out on the grader (practice 36-37 s here, but the
@@ -605,7 +608,12 @@ const chunkBytes = (form) =>
 function formsOf(rgba) {
   const { opaque, grey, colours } = analyse(rgba);
   const forms = [];
-  if (colours !== null) {
+  // v11: palette forms only for non-grey images. On grey images the
+  // palette candidates never won the screen (practice i004: palette+cover
+  // 107,211 B vs grey+cover 106,692 B; i008: 27,315 vs 26,750) but cost
+  // ~2.4 s/set in screen time. Skipping them is byte-identical on
+  // practice/val1/val2 and saves ~2 s/set.
+  if (colours !== null && !grey) {
     for (const [order, filters] of [
       ['count', [0, 'brute']],
       ['luminance', [0, 'brute']],
@@ -614,7 +622,7 @@ function formsOf(rgba) {
       const p = paletteForm(rgba, colours, order);
       forms.push({ colourType: 3, bpp: 1, samples: p.indices, plte: p.plte, trns: p.trns, filters });
     }
-    if (!grey) return forms;
+    return forms;
   }
   const key = opaque ? null : transparentKey(rgba, grey);
   let ct;
@@ -877,8 +885,8 @@ const HASH_SIZE = 1 << HASH_BITS;
 // the dominant cost; the short chain is the cheap win (when a long match
 // is already carried, a 32-step walk finds a closer, cheaper-distance
 // match the 8-step walk misses).
-const MAX_CHAIN = 192;
-const SHORT_CHAIN = 32;
+const MAX_CHAIN = 256;
+const SHORT_CHAIN = 48;
 const MAX_MATCHES = 6;
 
 function hashAt(data, i) {
