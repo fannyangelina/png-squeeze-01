@@ -1,6 +1,8 @@
-// png-squeeze-01 v11: v10 + 3 lever (MAX_CHAIN 192->256, SHORT_CHAIN 32->48,
-// skip palette forms pada gambar grey). Terverifikasi: practice 740.908, val1
-// 740.445, val2 739.527; lossless, deterministik. Runtime val2 ~37 dtk.
+// png-squeeze-01 v12: v11 + 2 lever (band weighing level 6, SHORT_CHAIN 48->64).
+// Terverifikasi: practice 746.166, val1 740.522, val2 740.167; lossless, deterministik.
+// Runtime val2 ~37,3 dtk. Band level 6 memulihkan -3.015 B di i002 practice yang
+// hilang di v10 saat band ranking turun ke level 1 (level-1 ranking salah besar di
+// i002: pemenang level-6 tidak masuk top-2 level-1, jadi two-stage top-2 gagal).
 // png-squeeze-01 v10: v9 with a deterministic runtime cut so the grade run
 // fits the grader wall on heavy sets. v9 (practice 745,099) was REJECTED:
 // its grade run timed out on the grader (practice 36-37 s here, but the
@@ -594,7 +596,7 @@ function filteredBands(samples, width, height, bpp, raw) {
     let bestBytes = Infinity;
     for (const s of BAND_STRATEGIES) {
       const buf = filterRows(samples, width, bpp, y0, y1, s, cand);
-      const n = deflateSync(buf.subarray(0, (y1 - y0) * (stride + 1)), { level: 1, memLevel: 8, dictionary: dict.length === 0 ? undefined : dict }).length;
+      const n = deflateSync(buf.subarray(0, (y1 - y0) * (stride + 1)), { level: 6, memLevel: 8, dictionary: dict.length === 0 ? undefined : dict }).length;
       if (n < bestBytes) { bestBytes = n; bestBuf = buf.slice(0, (y1 - y0) * (stride + 1)); }
     }
     raw.set(bestBuf, y0 * (stride + 1));
@@ -886,7 +888,7 @@ const HASH_SIZE = 1 << HASH_BITS;
 // is already carried, a 32-step walk finds a closer, cheaper-distance
 // match the 8-step walk misses).
 const MAX_CHAIN = 256;
-const SHORT_CHAIN = 48;
+const SHORT_CHAIN = 64;
 const MAX_MATCHES = 6;
 
 function hashAt(data, i) {
